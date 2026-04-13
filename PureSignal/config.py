@@ -35,7 +35,7 @@ MAX_SPEAKERS          = 4
 
 # --- Enrollment ---
 ENROLLMENT_THRESHOLD  = 0.65      # cosine sim floor to match enrolled speaker
-PROFILES_DIR          = Path(__file__).parent.parent / "profiles"  # centralized profiles directory
+PROFILES_DIR          = Path(__file__).parent / "profiles"  # centralized profiles directory
 ENROLLMENT_DURATION_S = 12        # recording length during enroll.py
 
 # --- Policy ---

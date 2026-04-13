@@ -207,4 +207,4 @@ load_env.ps1
 # Speaker Profiles
 ############################
 # Ignore all profile embeddings — re-enroll on each machine
-profiles/*.npy
+**/profiles/*.npy

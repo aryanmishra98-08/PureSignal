@@ -210,17 +210,22 @@ def _process_loop(stream) -> None:
 
         # Track
         speaker_id = tracker.assign(embedding)
-        log(f"[tracker] assigned → {speaker_id} "
+
+        # Resolve display label: use enrolled username if matched, else tracker ID
+        matched_name = enrollment.match(embedding)
+        display_label = matched_name if matched_name is not None else speaker_id
+
+        log(f"[tracker] assigned → {display_label} "
             f"(gallery size: {len(tracker.get_gallery())})")
 
         # Policy gate
-        passes = policy.should_pass(speaker_id, embedding)
+        passes = matched_name is not None if config.POLICY_MODE == "ENROLLED" else policy.should_pass(speaker_id, embedding)
 
         if passes:
-            log(f"[policy] {speaker_id} → PASS — sending to Ultravox")
+            log(f"[policy] {display_label} → PASS — sending to Ultravox")
             ultravox_client.send_segment(normalized)
         else:
-            log(f"[policy] {speaker_id} → DROP")
+            log(f"[policy] {display_label} → DROP")
 
 
 def main() -> None:

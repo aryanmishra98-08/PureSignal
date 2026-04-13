@@ -14,6 +14,12 @@ import numpy as np
 import sounddevice as sd
 import time
 import sys
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load secrets from keys/.env before any module that needs env vars
+load_dotenv(Path(__file__).parent / "keys" / ".env")
+
 import config
 from audio import features
 from speaker import encoder
