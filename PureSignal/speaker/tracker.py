@@ -4,8 +4,8 @@
 #                      In-memory only — gallery resets each session
 # =============================================================================
 
-import numpy as np
 import config
+import numpy as np
 
 # Gallery: { "S1": np.ndarray [256], "S2": ... }
 _gallery: dict[str, np.ndarray] = {}
@@ -13,7 +13,7 @@ _speaker_counter = 0
 
 
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b))   # both already L2-normalized
+    return float(np.dot(a, b))  # both already L2-normalized
 
 
 def _next_speaker_id() -> str:
@@ -43,10 +43,9 @@ def assign(embedding: np.ndarray) -> str:
 
     # Score against all centroids
     scores = {
-        sid: _cosine_sim(embedding, centroid)
-        for sid, centroid in _gallery.items()
+        sid: _cosine_sim(embedding, centroid) for sid, centroid in _gallery.items()
     }
-    best_id    = max(scores, key=scores.__getitem__)
+    best_id = max(scores, key=scores.__getitem__)
     best_score = scores[best_id]
 
     if best_score >= config.SIMILARITY_THRESHOLD:
@@ -68,8 +67,8 @@ def _ema_update(centroid: np.ndarray, new_embedding: np.ndarray) -> np.ndarray:
     """Exponential moving average update, re-normalized."""
     updated = (1 - config.EMA_ALPHA) * centroid + config.EMA_ALPHA * new_embedding
     norm = np.linalg.norm(updated)
-    if norm < 1e-6:
-        return centroid   # degenerate case — keep old centroid
+    if norm < config.NORM_FLOOR:
+        return centroid  # degenerate case — keep old centroid
     return (updated / norm).astype(np.float32)
 
 

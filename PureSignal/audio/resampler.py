@@ -3,12 +3,12 @@
 #                      Used immediately before WebSocket send
 # =============================================================================
 
+import config
 import numpy as np
 from scipy.signal import resample_poly
-import config
 
 # Resample ratio: 48000 / 16000 = 3/1
-_UP   = 3
+_UP = 3
 _DOWN = 1
 
 
@@ -39,4 +39,4 @@ def silence_frame_48k() -> bytes:
     960 samples = 20ms @ 48kHz.
     """
     samples = int(config.ULTRAVOX_IN_RATE * config.ULTRAVOX_CHUNK_MS / 1000)
-    return bytes(samples * 2)   # int16 = 2 bytes per sample
+    return bytes(samples * 2)  # int16 = 2 bytes per sample

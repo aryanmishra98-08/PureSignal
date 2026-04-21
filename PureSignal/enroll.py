@@ -10,19 +10,18 @@
 #   profiles/<username>.npy
 # =============================================================================
 
+import sys
+import time
+from pathlib import Path
+import config
 import numpy as np
 import sounddevice as sd
-import time
-import sys
-from pathlib import Path
+from audio import features
 from dotenv import load_dotenv
+from speaker import encoder
 
 # Load secrets from keys/.env before any module that needs env vars
 load_dotenv(Path(__file__).parent / "keys" / ".env")
-
-import config
-from audio import features
-from speaker import encoder
 
 
 def record(duration_s: int) -> np.ndarray:
@@ -30,12 +29,16 @@ def record(duration_s: int) -> np.ndarray:
     total_samples = duration_s * config.SAMPLE_RATE
     print(f"\n[enroll] Recording for {duration_s}s — speak naturally now...\n")
 
-    buffer = sd.rec(
-        frames=total_samples,
-        samplerate=config.SAMPLE_RATE,
-        channels=1,
-        dtype="float32",
-    )
+    try:
+        buffer = sd.rec(
+            frames=total_samples,
+            samplerate=config.SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+        )
+    except sd.PortAudioError as e:
+        print(f"[enroll] ERROR: Could not open microphone: {e}")
+        sys.exit(1)
 
     # Print a simple countdown
     for remaining in range(duration_s, 0, -1):
@@ -44,7 +47,7 @@ def record(duration_s: int) -> np.ndarray:
 
     sd.wait()
     print("\n[enroll] Recording complete.")
-    return buffer[:, 0]   # flatten to 1D
+    return buffer[:, 0]  # flatten to 1D
 
 
 def prompt_username() -> str:
@@ -74,16 +77,22 @@ def main() -> None:
     output_path = config.PROFILES_DIR / f"{username}.npy"
 
     if output_path.exists():
-        overwrite = input(
-            f"\n  Profile '{username}' already exists. Overwrite? [y/N]: "
-        ).strip().lower()
+        overwrite = (
+            input(f"\n  Profile '{username}' already exists. Overwrite? [y/N]: ")
+            .strip()
+            .lower()
+        )
         if overwrite != "y":
             print("[enroll] Aborted.")
             sys.exit(0)
 
     # Step 2 — Load encoder
     print("\n[enroll] Loading encoder (first run downloads model)...")
-    encoder.load_encoder()
+    try:
+        encoder.load_encoder()
+    except EnvironmentError as e:
+        print(str(e))
+        sys.exit(1)
 
     # Step 3 — Record
     audio = record(config.ENROLLMENT_DURATION_S)
@@ -106,8 +115,12 @@ def main() -> None:
         sys.exit(1)
 
     # Step 6 — Save to profiles/<username>.npy
-    config.PROFILES_DIR.mkdir(parents=True, exist_ok=True)
-    np.save(output_path, embedding)
+    try:
+        config.PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        np.save(output_path, embedding)
+    except OSError as e:
+        print(f"[enroll] ERROR: Failed to save profile to '{output_path}': {e}")
+        sys.exit(1)
     print(
         f"\n[enroll] Enrollment complete.\n"
         f"  Username        : {username}\n"

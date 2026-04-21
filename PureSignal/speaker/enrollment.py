@@ -3,9 +3,10 @@
 #                         Profiles are written by enroll.py and loaded at runtime
 # =============================================================================
 
-import numpy as np
-import config
 from typing import Optional
+
+import config
+import numpy as np
 
 # Maps username -> normalized embedding
 _enrolled: dict[str, np.ndarray] = {}
@@ -31,36 +32,11 @@ def load_profiles(usernames: list[str]) -> None:
 
         embedding = np.load(path).astype(np.float32)
         norm = np.linalg.norm(embedding)
-        if norm > 1e-6:
+        if norm > config.NORM_FLOOR:
             embedding /= norm
 
         _enrolled[username] = embedding
         print(f"[enrollment] loaded profile '{username}' from '{path}'")
-
-
-def load_store() -> None:
-    """
-    Legacy single-user load — kept for backward compatibility.
-    Loads all .npy files found in the profiles directory.
-    """
-    if not config.PROFILES_DIR.exists():
-        print(
-            f"[enrollment] WARNING: profiles directory not found at '{config.PROFILES_DIR}'.\n"
-            f"  ENROLLED mode will drop all audio.\n"
-            f"  Run enroll.py first if using ENROLLED mode."
-        )
-        return
-
-    usernames = [p.stem for p in config.PROFILES_DIR.glob("*.npy")]
-    if not usernames:
-        print(
-            f"[enrollment] WARNING: no profiles found in '{config.PROFILES_DIR}'.\n"
-            f"  ENROLLED mode will drop all audio.\n"
-            f"  Run enroll.py first if using ENROLLED mode."
-        )
-        return
-
-    load_profiles(usernames)
 
 
 def match(embedding: np.ndarray) -> Optional[str]:

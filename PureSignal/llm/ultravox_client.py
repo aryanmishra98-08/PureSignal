@@ -13,16 +13,24 @@
 # =============================================================================
 
 import asyncio
+import json
 import queue
 import threading
-import numpy as np
+import config
 import sounddevice as sd
 import websockets
-import config
-from audio.resampler import to_48k_pcm, silence_frame_48k
+import websockets.exceptions
+from audio.resampler import silence_frame_48k, to_48k_pcm
 
 # Queue fed by main.py — holds resampled PCM bytes (full segments)
-audio_send_queue: queue.Queue[bytes | None] = queue.Queue()
+audio_send_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=50)
+
+# Retry constants for WebSocket connection
+_MAX_RETRIES = 3
+_RETRY_DELAY_S = 2.0
+
+# Thread safety for shared state
+_lock = threading.Lock()
 
 # Playback output stream — opened once, written to continuously
 _output_stream: sd.RawOutputStream | None = None
@@ -67,7 +75,7 @@ async def _send_loop(ws) -> None:
             # Slice segment into 20ms frames and send sequentially
             offset = 0
             while offset < len(segment_bytes):
-                frame = segment_bytes[offset: offset + _FRAME_BYTES]
+                frame = segment_bytes[offset : offset + _FRAME_BYTES]
 
                 # Pad last frame if shorter than 20ms
                 if len(frame) < _FRAME_BYTES:
@@ -105,14 +113,16 @@ async def _receive_loop(ws) -> None:
         else:
             # JSON data message — check for playbackClearBuffer
             try:
-                import json as _json
-                data = _json.loads(message)
-                if data.get("type") == "playbackClearBuffer" and _output_stream is not None:
+                data = json.loads(message)
+                if (
+                    data.get("type") == "playbackClearBuffer"
+                    and _output_stream is not None
+                ):
                     # Abort current buffer — stop and restart stream to flush
                     _output_stream.stop()
                     _output_stream.start()
-            except Exception:
-                pass  # non-critical, ignore parse errors
+            except (json.JSONDecodeError, KeyError):
+                pass  # non-critical text messages — safe to ignore
 
 
 async def _run(join_url: str) -> None:
@@ -121,16 +131,25 @@ async def _run(join_url: str) -> None:
 
     print(f"[ultravox] connecting to {join_url[:60]}...")
 
-    async with websockets.connect(join_url) as ws:
-        print("[ultravox] connected")
-        _running = True
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            async with websockets.connect(join_url, open_timeout=10) as ws:
+                print("[ultravox] connected")
+                with _lock:
+                    _running = True
 
-        await asyncio.gather(
-            _send_loop(ws),
-            _receive_loop(ws),
-        )
+                await asyncio.gather(
+                    _send_loop(ws),
+                    _receive_loop(ws),
+                )
+            print("[ultravox] WebSocket closed")
+            return
+        except (websockets.exceptions.WebSocketException, OSError) as e:
+            print(f"[ultravox] connection attempt {attempt}/{_MAX_RETRIES} failed: {e}")
+            if attempt < _MAX_RETRIES:
+                await asyncio.sleep(_RETRY_DELAY_S)
 
-    print("[ultravox] WebSocket closed")
+    print("[ultravox] FATAL: all connection attempts failed — giving up")
 
 
 def start(join_url: str) -> threading.Thread:
@@ -145,35 +164,38 @@ def start(join_url: str) -> threading.Thread:
         asyncio.run(_run(join_url))
 
     thread = threading.Thread(
-        target=_thread_target,
-        daemon=True,
-        name="ultravox-client"
+        target=_thread_target, daemon=True, name="ultravox-client"
     )
     thread.start()
     print("[ultravox] client thread started")
     return thread
 
 
-def send_segment(segment: np.ndarray) -> None:
+def send_segment(audio_bytes: bytes) -> None:
     """
     Called by main.py after policy gate passes.
     Resamples segment to 48kHz PCM and enqueues for send_loop.
 
     Args:
-        segment: float32 ndarray at 16kHz — already normalized
+        audio_bytes: float32 ndarray at 16kHz — already normalized
     """
-    pcm_bytes = to_48k_pcm(segment)
-    audio_send_queue.put(pcm_bytes)
+    pcm_bytes = to_48k_pcm(audio_bytes)
+    try:
+        audio_send_queue.put_nowait(pcm_bytes)
+    except queue.Full:
+        print("[ultravox] send queue full — dropping segment")
 
 
 def stop() -> None:
     """Signal send_loop to exit and close playback stream."""
     global _running, _output_stream
-    _running = False
-    audio_send_queue.put(None)   # unblock send_loop if waiting
+    with _lock:
+        _running = False
+    audio_send_queue.put(None)  # unblock send_loop if waiting
 
-    if _output_stream is not None:
-        _output_stream.stop()
-        _output_stream.close()
-        _output_stream = None
-        print("[ultravox] playback stream closed")
+    with _lock:
+        if _output_stream is not None:
+            _output_stream.stop()
+            _output_stream.close()
+            _output_stream = None
+    print("[ultravox] playback stream closed")

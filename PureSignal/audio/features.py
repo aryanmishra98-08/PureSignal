@@ -3,7 +3,9 @@
 #                     Normalization only — mel extraction handled by encoder
 # =============================================================================
 
+import config
 import numpy as np
+
 
 def normalize(segment: np.ndarray) -> np.ndarray:
     """
@@ -12,7 +14,7 @@ def normalize(segment: np.ndarray) -> np.ndarray:
     Returns float32 ndarray at original sample rate.
     """
     peak = np.max(np.abs(segment))
-    if peak < 1e-6:
+    if peak < config.NORM_FLOOR:
         # Near-silent segment — return as-is, encoder will produce
         # a near-zero embedding, tracker will discard it
         return segment.astype(np.float32)

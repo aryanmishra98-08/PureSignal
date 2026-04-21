@@ -6,8 +6,9 @@
 # DYNAMIC mode:  passes audio only if speaker ID matches DYNAMIC_TARGET
 # =============================================================================
 
-import numpy as np
 import config
+import numpy as np
+
 from speaker import enrollment
 
 
@@ -33,7 +34,7 @@ def should_pass(speaker_id: str, embedding: np.ndarray) -> bool:
     # Unknown mode — fail loudly rather than silently passing all audio
     raise ValueError(
         f"[policy] Unknown POLICY_MODE: '{config.POLICY_MODE}'. "
-        f"Expected 'ENROLLED' or 'DYNAMIC'."
+        "Expected 'ENROLLED' or 'DYNAMIC'."
     )
 
 

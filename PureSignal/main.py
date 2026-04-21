@@ -10,16 +10,18 @@
 #   - enroll.py must have been run for each user (profiles/<username>.npy)
 # =============================================================================
 
+import concurrent.futures
 import os
-import sys
 import signal
-import requests
+import sys
 import config
-from audio import capture, vad, features
-from speaker import encoder, tracker, enrollment, policy
+import numpy as np
+import requests
+from audio import capture, features, vad
 from llm import ultravox_client
+from speaker import encoder, enrollment, policy, tracker
 
-_MAX_MULTI_USER = 10   # upper bound on multi-user selections
+_MAX_MULTI_USER = 10  # upper bound on multi-user selections
 
 
 def log(msg: str) -> None:
@@ -57,10 +59,19 @@ def _create_ultravox_call() -> str:
         timeout=10,
     )
     if not resp.ok:
-        print(f"\n[main] FATAL: Ultravox call creation failed: {resp.status_code} {resp.text}\n")
+        print(
+            f"\n[main] FATAL: Ultravox call creation failed: "
+            f"{resp.status_code} {resp.text}\n"
+        )
         sys.exit(1)
 
-    join_url = resp.json()["joinUrl"]
+    data = resp.json()
+    join_url = data.get("joinUrl")
+    if not join_url:
+        print(
+            f"\n[main] FATAL: Ultravox response missing 'joinUrl'. Response: {data}\n"
+        )
+        sys.exit(1)
     print(f"[main] Ultravox call created — {join_url[:60]}...")
     return join_url
 
@@ -105,20 +116,29 @@ def _select_users() -> list[str]:
             username = input("  Enter username: ").strip()
             if username in available:
                 return [username]
-            print(f"  Profile '{username}' not found. Available: {', '.join(available)}")
+            print(
+                f"  Profile '{username}' not found. Available: "
+                f"{', '.join(available)}"
+            )
     else:
         # Multi-user: collect until "done" or _MAX_MULTI_USER limit
         selected: list[str] = []
-        print(f"  Enter usernames one at a time. Type 'done' when finished (max {_MAX_MULTI_USER}).")
+        print(
+            f"Enter usernames one at a time. Type 'done' when finished "
+            f"(max {_MAX_MULTI_USER})."
+        )
         while len(selected) < _MAX_MULTI_USER:
-            username = input(f"  Username [{len(selected)+1}] (or 'done'): ").strip()
+            username = input(f"  Username [{len(selected) + 1}] (or 'done'): ").strip()
             if username.lower() == "done":
                 if not selected:
                     print("  Must select at least one user.")
                     continue
                 break
             if username not in available:
-                print(f"  Profile '{username}' not found. Available: {', '.join(available)}")
+                print(
+                    f"  Profile '{username}' not found. Available: "
+                    f"{', '.join(available)}"
+                )
                 continue
             if username in selected:
                 print(f"  '{username}' already added.")
@@ -135,7 +155,8 @@ def _validate_config() -> None:
     if not api_key and not join_url:
         print(
             "\n[main] FATAL: Neither ULTRAVOX_API_KEY nor ULTRAVOX_JOIN_URL is set.\n"
-            "  Set ULTRAVOX_API_KEY in config.py (or as env var) to auto-create calls.\n"
+            "  Set ULTRAVOX_API_KEY in config.py (or as env var)\n"
+            "  to auto-create calls.\n"
         )
         sys.exit(1)
 
@@ -184,48 +205,60 @@ def _process_loop(stream) -> None:
     """
     Main processing loop — runs until KeyboardInterrupt.
     Reads frames from capture.frame_queue and drives the full pipeline.
+    Encoder runs in a worker thread to avoid blocking the main loop.
     """
     log("[main] processing loop started")
 
-    while True:
-        # Blocking read — waits for next 20ms frame from mic
-        frame = capture.frame_queue.get()
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="encoder"
+    ) as pool:
+        pending: concurrent.futures.Future | None = None
+        pending_normalized: np.ndarray | None = None
 
-        # VAD — returns None (mid-segment / silence) or complete segment
-        segment = vad.process_frame(frame)
-        if segment is None:
-            continue
+        while True:
+            frame = capture.frame_queue.get()
+            segment = vad.process_frame(frame)
+            if segment is None:
+                continue
 
-        log(f"[vad] segment ready — {len(segment)} samples "
-            f"({len(segment) / config.SAMPLE_RATE:.2f}s)")
+            log(
+                f"[vad] segment ready — {len(segment)} samples "
+                f"({len(segment) / config.SAMPLE_RATE:.2f}s)"
+            )
 
-        # Normalize
-        normalized = features.normalize(segment)
+            # If encoder is still busy, drop the new segment (avoids queue buildup)
+            if pending is not None and not pending.done():
+                log("[main] encoder busy — dropping segment")
+                continue
 
-        # Embed
-        embedding = encoder.embed(normalized)
-        if embedding is None:
-            log("[encoder] segment too short — skipped")
-            continue
+            # Process the result of a completed future
+            if pending is not None and pending.done():
+                embedding = pending.result()
+                if embedding is not None:
+                    speaker_id = tracker.assign(embedding)
+                    matched_name = enrollment.match(embedding)
+                    display_label = (
+                        matched_name if matched_name is not None else speaker_id
+                    )
+                    log(
+                        f"[tracker] assigned → {display_label} "
+                        f"(gallery size: {len(tracker.get_gallery())})"
+                    )
+                    passes = policy.should_pass(speaker_id, embedding)
+                    if passes:
+                        log(f"[policy] {display_label} → PASS — sending to Ultravox")
+                        ultravox_client.send_segment(pending_normalized)
+                    else:
+                        log(f"[policy] {display_label} → DROP")
+                else:
+                    log("[encoder] segment too short — skipped")
+                pending = None
+                pending_normalized = None
 
-        # Track
-        speaker_id = tracker.assign(embedding)
-
-        # Resolve display label: use enrolled username if matched, else tracker ID
-        matched_name = enrollment.match(embedding)
-        display_label = matched_name if matched_name is not None else speaker_id
-
-        log(f"[tracker] assigned → {display_label} "
-            f"(gallery size: {len(tracker.get_gallery())})")
-
-        # Policy gate
-        passes = matched_name is not None if config.POLICY_MODE == "ENROLLED" else policy.should_pass(speaker_id, embedding)
-
-        if passes:
-            log(f"[policy] {display_label} → PASS — sending to Ultravox")
-            ultravox_client.send_segment(normalized)
-        else:
-            log(f"[policy] {display_label} → DROP")
+            # Submit new segment to encoder thread
+            normalized = features.normalize(segment)
+            pending_normalized = normalized
+            pending = pool.submit(encoder.embed, normalized)
 
 
 def main() -> None:
@@ -233,17 +266,24 @@ def main() -> None:
 
     usernames = _select_users()
 
-    stream = _startup(usernames)
+    # Register SIGINT before startup so Ctrl+C during model load is handled cleanly
+    stream_holder: list = [None]
 
-    # Register Ctrl+C handler for clean shutdown
     def _handle_sigint(sig, frame):
-        _shutdown(stream)
+        if stream_holder[0] is not None:
+            _shutdown(stream_holder[0])
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _handle_sigint)
 
+    stream = _startup(usernames)
+    stream_holder[0] = stream
+
     try:
         _process_loop(stream)
+    except KeyboardInterrupt:
+        _shutdown(stream)
+        sys.exit(0)
     except Exception as e:
         print(f"\n[main] unhandled error: {e}")
         _shutdown(stream)
