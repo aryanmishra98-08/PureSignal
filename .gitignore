@@ -38,7 +38,7 @@ myenv/
 .env.*
 .envrc
 *.local
-keys/.env
+.env
 
 ############################
 # Testing / Coverage

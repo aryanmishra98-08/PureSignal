@@ -54,7 +54,7 @@ def load_encoder() -> None:
 
     _device = _resolve_device()
     print(f"[encoder] loading {config.ENCODER_MODEL} ...")
-    _model = Model.from_pretrained(config.ENCODER_MODEL, use_auth_token=token)
+    _model = Model.from_pretrained(config.ENCODER_MODEL, token=token)
     _model = _model.to(torch.device(_device))
     _model.eval()
 

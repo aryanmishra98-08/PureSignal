@@ -1,7 +1,8 @@
 # =============================================================================
-# requirements.txt — speaker_focus project
+# requirements.txt — PureSignal project
 # Python 3.10+ required
 # Install: pip install -r requirements.txt
+# For exact reproduction: pip install -r requirements-lock.txt
 # =============================================================================
 
 # Audio capture and playback
@@ -10,7 +11,7 @@ sounddevice>=0.4.6
 # WebSocket client for Fixie.ai Ultravox
 websockets>=12.0
 
-# Signal processing — resampling
+# Signal processing — resampling, WAV I/O
 scipy>=1.11.0
 
 # Numerical computing
@@ -28,3 +29,12 @@ huggingface-hub>=0.22.0
 
 # Environment variable loading from .env files
 python-dotenv>=1.0.0
+
+# YAML config loading
+pyyaml>=6.0
+
+# Evaluation plots (optional — skip if running headless)
+matplotlib>=3.8.0
+
+# VAD TextGrid label support (optional)
+textgrid>=1.5.0

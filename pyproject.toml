@@ -7,26 +7,19 @@ license = "MIT"
 readme = "README.md"
 
 [tool.poetry.dependencies]
-# Main Python version
 python = ">=3.10,<3.12"
-# Audio capture and playback
 sounddevice = ">=0.4.6"
-# WebSocket client for Fixie.ai Ultravox
 websockets = ">=12.0"
-# Signal processing — resampling
 scipy = ">=1.11.0"
-# Numerical computing
 numpy = ">=1.26.0"
-# Deep learning — MPS backend for Apple Silicon
 torch = ">=2.2.0,<2.4.0"
-# Speaker embedding model + inference wrapper
-pyannote.audio = ">=3.1.0,<4.0.0"
-# HuggingFace model loading
+"pyannote.audio" = ">=3.1.0,<4.0.0"
 transformers = ">=4.40.0"
 huggingface-hub = ">=0.22.0"
-# Environment variable loading from .env files
 python-dotenv = ">=1.0.0"
-# Add main dependencies from requirements.txt below
+pyyaml = ">=6.0"
+matplotlib = ">=3.8.0"
+textgrid = ">=1.5.0"
 
 [tool.poetry.dev-dependencies]
 ruff = "*"
@@ -35,6 +28,13 @@ pytest = "*"
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]

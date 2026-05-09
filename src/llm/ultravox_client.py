@@ -17,6 +17,7 @@ import json
 import queue
 import threading
 import config
+import numpy as np
 import sounddevice as sd
 import websockets
 import websockets.exceptions
@@ -171,15 +172,15 @@ def start(join_url: str) -> threading.Thread:
     return thread
 
 
-def send_segment(audio_bytes: bytes) -> None:
+def send_segment(segment: np.ndarray) -> None:
     """
     Called by main.py after policy gate passes.
     Resamples segment to 48kHz PCM and enqueues for send_loop.
 
     Args:
-        audio_bytes: float32 ndarray at 16kHz — already normalized
+        segment: float32 ndarray at 16kHz — already normalized
     """
-    pcm_bytes = to_48k_pcm(audio_bytes)
+    pcm_bytes = to_48k_pcm(segment)
     try:
         audio_send_queue.put_nowait(pcm_bytes)
     except queue.Full:

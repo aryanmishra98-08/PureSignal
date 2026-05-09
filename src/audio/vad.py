@@ -89,6 +89,21 @@ def process_frame(frame: np.ndarray) -> np.ndarray | None:
     return None
 
 
+def flush() -> np.ndarray | None:
+    """
+    Return any buffered speech segment and reset speech state.
+    Call when the audio source ends (e.g. EOF sentinel from file_capture)
+    to avoid losing the final speech segment that never saw trailing silence.
+    """
+    global _speech_active, _segment_fill
+    if _speech_active and _segment_fill > 0:
+        segment = _segment_buf[:_segment_fill].copy()
+        _speech_active = False
+        _segment_fill = 0
+        return segment
+    return None
+
+
 def reset() -> None:
     """Reset all VAD state — call between sessions."""
     global _noise_floor, _hangover_frames_left, _speech_active, _segment_fill
