@@ -211,3 +211,4 @@ load_env.ps1
 ############################
 # Ignore all profile embeddings — re-enroll on each machine
 **/profiles/*.npy
+**/profiles/*.json
