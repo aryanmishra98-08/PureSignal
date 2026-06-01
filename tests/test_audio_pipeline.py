@@ -1,3 +1,10 @@
+# =============================================================================
+# tests/test_audio_pipeline.py — Unit tests for the audio processing stage
+#
+# Covers: audio/vad.py, audio/features.py, audio/resampler.py
+# No hardware required — all tests use synthetic numpy arrays.
+# Run with: pytest tests/test_audio_pipeline.py -v
+# =============================================================================
 import numpy as np
 import pytest
 import config

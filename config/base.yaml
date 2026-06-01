@@ -1,44 +1,96 @@
+# =============================================================================
+# config/base.yaml — Master configuration for the PureSignal pipeline.
+#
+# Override individual values at runtime without editing this file:
+#   python src/main.py --set vad.hangover_ms=300
+#
+# Or point to an alternate YAML:
+#   python src/main.py --config path/to/custom.yaml
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Audio capture
+# ---------------------------------------------------------------------------
 audio:
-  sample_rate: 16000
-  frame_ms: 20
-  window_size_s: 1.5
-  hop_size_s: 0.25
+  sample_rate: 16000      # Hz — all models expect 16kHz mono input
+  frame_ms: 20            # VAD frame length; must be 10, 20, or 30ms
+  window_size_s: 1.5      # sliding window length fed to the extractor (s)
+  hop_size_s: 0.25        # stride between consecutive windows (s)
 
+# ---------------------------------------------------------------------------
+# Voice Activity Detection
+# ---------------------------------------------------------------------------
 vad:
-  energy_multiplier: 3.0
-  zcr_threshold: 0.3
-  hangover_ms: 400
-  noise_floor_init: 0.01
+  energy_multiplier: 3.0  # speech threshold = noise_floor × multiplier
+  zcr_threshold: 0.3      # zero-crossing rate gate (high ZCR ≈ noise/unvoiced)
+  hangover_ms: 400        # tail silence tolerated before closing a segment (ms)
+  noise_floor_init: 0.01  # initial noise floor estimate (RMS)
 
+# ---------------------------------------------------------------------------
+# Extractor — SpeakerBeam / Conv-TasNet target-speaker separation
+# Disable with: --set extractor.enabled=false  (reverts to gatekeeper mode)
+# ---------------------------------------------------------------------------
+extractor:
+  enabled: true           # false → skip separation, use raw mic audio
+  window_s: 1.0           # window length passed to the model (s)
+  hop_s: 0.25             # hop between windows sent to extraction workers (s)
+  model: speakerbeam      # "speakerbeam" | "conv_tasnet"
+  device: mps             # "mps" | "cpu" | "cuda"
+  max_workers: 2          # parallel ThreadPoolExecutor workers for extraction
+
+# ---------------------------------------------------------------------------
+# Speaker encoder — pyannote wespeaker-voxceleb-resnet34-LM
+# Requires: HF_TOKEN env var + accepted model terms on HuggingFace
+# ---------------------------------------------------------------------------
 encoder:
   model: pyannote/wespeaker-voxceleb-resnet34-LM
-  device: mps
-  embedding_dim: 256
-  min_segment_s: 0.5
+  device: mps             # "mps" | "cpu" | "cuda"
+  embedding_dim: 256      # ResNet34-LM output size
+  min_segment_s: 0.5      # segments shorter than this are silently skipped
 
+# ---------------------------------------------------------------------------
+# Online speaker tracker — cosine similarity + EMA gallery
+# ---------------------------------------------------------------------------
 tracker:
-  similarity_threshold: 0.65
-  ema_alpha: 0.25
-  max_speakers: 4
+  similarity_threshold: 0.65  # minimum cosine similarity to match a gallery entry
+  ema_alpha: 0.25             # centroid update weight (higher → adapts faster)
+  max_speakers: 4             # maximum simultaneous speakers tracked per session
 
+# ---------------------------------------------------------------------------
+# Enrollment store — pre-recorded speaker profiles
+# ---------------------------------------------------------------------------
 enrollment:
-  threshold: 0.65
-  duration_s: 12
-  num_samples: 3
+  threshold: 0.65     # cosine similarity required to match an enrolled name
+  duration_s: 12      # seconds of speech recorded per enrollment session
+  num_samples: 3      # number of embeddings averaged to build a profile
 
+# ---------------------------------------------------------------------------
+# Gating policy — which speakers are forwarded to Ultravox
+# ---------------------------------------------------------------------------
 policy:
-  mode: ENROLLED
-  dynamic_target: S1
+  mode: ENROLLED        # "ENROLLED" — only matched enrolled speakers pass
+                        # "ALL"      — every speaker passes
+                        # "DYNAMIC"  — only the speaker assigned dynamic_target passes
+  dynamic_target: S1    # tracker gallery ID used when mode=DYNAMIC
 
+# ---------------------------------------------------------------------------
+# Ultravox API streaming
+# ---------------------------------------------------------------------------
 ultravox:
-  in_rate: 48000
-  out_rate: 48000
-  chunk_ms: 20
+  in_rate: 48000    # PCM sample rate sent TO Ultravox (Hz)
+  out_rate: 48000   # PCM sample rate received FROM Ultravox (Hz)
+  chunk_ms: 20      # audio chunk size for the send loop (ms)
 
+# ---------------------------------------------------------------------------
+# Internal numerical constants — rarely need changing
+# ---------------------------------------------------------------------------
 internal:
-  norm_floor: 1.0e-6
-  noise_floor_ema_fast: 0.05
-  noise_floor_ema_slow: 0.95
+  norm_floor: 1.0e-6          # minimum L2 norm to avoid division by zero
+  noise_floor_ema_fast: 0.05  # EMA coefficient while speech is active
+  noise_floor_ema_slow: 0.95  # EMA coefficient during silence (slow decay)
 
-random_seed: 42
-debug: true
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+random_seed: 42  # seeds numpy + torch for reproducible test runs
+debug: true      # enables verbose [module] console prints

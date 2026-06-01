@@ -1,49 +1,42 @@
 """
-audio/file_capture.py — WAV-file audio source that mimics capture.py's interface.
+audio/file_capture.py — WAV-file audio source, drop-in replacement for the mic.
 
-Pushes 20ms float32 frames into frame_queue at real-time cadence so the rest of
-the pipeline (VAD → encoder → tracker → policy) runs unmodified.
+Reads a WAV file from disk and feeds it into the same queues that
+audio/capture.py normally fills from the microphone, so the rest of the
+pipeline (VAD, encoder, etc.) is unaware of the source difference.
 
-Supported input: mono, 16kHz, float32 WAV.
-If the file is stereo or at a different sample rate, it is converted automatically.
+Routing (mirrors capture.py):
+  Extractor enabled  → pushes (seq_no, window) tuples to capture.window_queue
+  Extractor disabled → pushes raw 20ms float32 frames to capture.frame_queue
 
-Usage (from main.py --source <path>):
-    from audio.file_capture import AudioFileCapture
-    source = AudioFileCapture(Path("recording.wav"), frame_queue)
-    thread = source.start()
-    ...
-    source.stop()
-    thread.join()
+Audio is replayed in real-time (time.sleep per frame) to mimic live capture.
+A None sentinel is pushed after the last frame to signal end-of-stream.
 """
-
 from __future__ import annotations
-
-import queue
-import threading
-import time
+import queue, threading, time
 from pathlib import Path
-
 import config
 import numpy as np
 
 
-def _load_wav_as_float32_mono_16k(path: Path) -> np.ndarray:
+def _load_wav(path: Path) -> np.ndarray:
     """
-    Load a WAV file and return a mono float32 array at 16kHz.
-    Converts sample rate and channel count if needed.
-    """
-    try:
-        from scipy.io import wavfile
-        from scipy.signal import resample_poly
-        from math import gcd
-    except ImportError as e:
-        raise RuntimeError(
-            "scipy is required for WAV file playback: pip install scipy"
-        ) from e
+    Load a WAV file and return a 16kHz mono float32 array.
 
+    Handles any integer or float dtype and resamples to config.SAMPLE_RATE
+    if needed.  Stereo files are downmixed to mono by averaging channels.
+
+    Args:
+        path: Path to the .wav file.
+
+    Returns:
+        np.ndarray [N] — float32 samples in the range [-1, 1] at 16kHz.
+    """
+    from scipy.io import wavfile
+    from scipy.signal import resample_poly
+    from math import gcd
     rate, data = wavfile.read(path)
-
-    # Convert to float32
+    # Normalize to float32 [-1, 1]
     if data.dtype == np.int16:
         audio = data.astype(np.float32) / 32768.0
     elif data.dtype == np.int32:
@@ -54,78 +47,119 @@ def _load_wav_as_float32_mono_16k(path: Path) -> np.ndarray:
         audio = data.astype(np.float32)
     else:
         audio = data.astype(np.float32)
-
-    # Stereo → mono
+    # Downmix stereo → mono
     if audio.ndim == 2:
         audio = audio.mean(axis=1)
-
-    # Resample to 16kHz if needed
-    target_rate = config.SAMPLE_RATE
-    if rate != target_rate:
-        g = gcd(rate, target_rate)
-        audio = resample_poly(audio, target_rate // g, rate // g).astype(np.float32)
-
+    # Resample if native rate differs from pipeline rate
+    target = config.SAMPLE_RATE
+    if rate != target:
+        g = gcd(rate, target)
+        audio = resample_poly(audio, target // g, rate // g).astype(np.float32)
     return audio
 
 
 class AudioFileCapture:
     """
-    Reads a WAV file and feeds it into frame_queue at real-time 20ms cadence.
-    When the file is exhausted, pushes None as a sentinel so the main loop exits.
+    Daemon thread that streams a WAV file into the pipeline queues.
+
+    Usage:
+        source = AudioFileCapture(Path("speech.wav"), capture.frame_queue)
+        thread = source.start()
+        # ... pipeline runs ...
+        source.stop()
+        thread.join()
     """
 
     def __init__(self, wav_path: Path, frame_queue: queue.Queue) -> None:
+        """
+        Args:
+            wav_path:    Path to the source WAV file.
+            frame_queue: capture.frame_queue — used in gatekeeper mode only.
+                         Extractor mode writes to capture.window_queue directly.
+        """
         self._path = Path(wav_path)
-        self._queue = frame_queue
+        self._frame_queue = frame_queue
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> threading.Thread:
-        """Load the WAV and begin streaming frames. Returns the background thread."""
-        audio = _load_wav_as_float32_mono_16k(self._path)
-        self._thread = threading.Thread(
-            target=self._run,
-            args=(audio,),
-            daemon=True,
-            name="file-capture",
-        )
+        """
+        Load the WAV file and begin streaming on a daemon thread.
+
+        Returns:
+            The started threading.Thread — join it after stop() to wait for EOF.
+        """
+        audio = _load_wav(self._path)
+        self._thread = threading.Thread(target=self._run, args=(audio,), daemon=True, name="file-capture")
         self._thread.start()
         print(
             f"[file_capture] streaming '{self._path.name}' — "
-            f"{len(audio) / config.SAMPLE_RATE:.1f}s @ {config.SAMPLE_RATE}Hz"
+            f"{len(audio)/config.SAMPLE_RATE:.1f}s, "
+            f"extractor={'enabled' if config.EXTRACTOR_ENABLED else 'disabled'}"
         )
         return self._thread
 
     def stop(self) -> None:
+        """Signal the streaming thread to stop after the current frame."""
         self._stop_event.set()
 
     def _run(self, audio: np.ndarray) -> None:
+        """
+        Main streaming loop — runs on a daemon thread.
+
+        Slices `audio` into FRAME_SAMPLES chunks and pushes each to the
+        appropriate queue, sleeping FRAME_MS ms between chunks to simulate
+        real-time capture.  On natural EOF or stop(), flushes any buffered
+        window data and pushes a None sentinel.
+        """
+        from audio import capture as _capture
         frame_size = config.FRAME_SAMPLES
-        frame_duration_s = config.FRAME_MS / 1000.0
+        frame_dur = config.FRAME_MS / 1000.0  # seconds per frame
         offset = 0
+        win_buf = None
+        if config.EXTRACTOR_ENABLED:
+            from audio.window_buffer import SlidingWindowBuffer
+            win_buf = SlidingWindowBuffer()
 
         while not self._stop_event.is_set():
-            chunk = audio[offset : offset + frame_size]
+            chunk = audio[offset: offset + frame_size]
             if len(chunk) == 0:
-                break
-
-            # Pad the last frame if it's shorter than frame_size
+                break  # natural EOF
             if len(chunk) < frame_size:
+                # Zero-pad the final partial frame
                 chunk = np.pad(chunk, (0, frame_size - len(chunk)))
-
-            try:
-                self._queue.put_nowait(chunk)
-            except queue.Full:
-                pass  # drop frame if consumer is behind
-
+            if win_buf is not None:
+                # Extractor path — accumulate until a full window is ready
+                result = win_buf.push(chunk)
+                if result is not None:
+                    try:
+                        _capture.window_queue.put_nowait(result)
+                    except queue.Full:
+                        pass
+            else:
+                # Gatekeeper path — push raw frame directly
+                try:
+                    self._frame_queue.put_nowait(chunk)
+                except queue.Full:
+                    pass
             offset += frame_size
-            time.sleep(frame_duration_s)  # real-time cadence
+            time.sleep(frame_dur)  # real-time pacing
 
-        # Sentinel — signals main loop to exit cleanly.
-        # Use blocking put (not put_nowait) so the sentinel is never dropped,
-        # but cap the wait at 5s to avoid hanging if the consumer has stalled.
-        try:
-            self._queue.put(None, timeout=5)
-        except queue.Full:
-            pass  # consumer stalled; main loop will time out via other means
+        # EOF — flush remaining buffered audio and push None sentinel
+        if win_buf is not None:
+            result = win_buf.flush()
+            if result is not None:
+                try:
+                    _capture.window_queue.put(result, timeout=2)
+                except queue.Full:
+                    pass
+            try:
+                _capture.window_queue.put(None, timeout=5)  # EOF sentinel
+            except queue.Full:
+                pass
+        else:
+            try:
+                self._frame_queue.put(None, timeout=5)  # EOF sentinel
+            except queue.Full:
+                pass
         print("[file_capture] stream ended")

@@ -1,6 +1,6 @@
 # PureSignal
 
-A real-time speaker-focused audio pipeline for Apple Silicon. PureSignal listens to your microphone, identifies enrolled speakers using voice embeddings, and streams only their speech to an [Ultravox](https://ultravox.ai) AI voice agent — silently dropping everyone else.
+A real-time speaker-focused audio pipeline for Apple Silicon. PureSignal listens to your microphone, isolates the enrolled target speaker's voice using neural source separation, and streams only their speech to an [Ultravox](https://ultravox.ai) AI voice agent — silently dropping everyone else.
 
 ---
 
@@ -21,14 +21,16 @@ A real-time speaker-focused audio pipeline for Apple Silicon. PureSignal listens
 
 ## Features
 
+- **Target speaker extraction** — SpeakerBeam (or Conv-TasNet) actively isolates the enrolled speaker's voice from a mixed signal before VAD, suppressing background voices rather than simply gating them
 - **Voice enrollment** — record multiple voice samples per user and average their embeddings into a single profile with a quality gate
 - **Real-time speaker identification** — cosine similarity against enrolled embeddings on every speech segment
 - **Multi-user support** — enroll and select up to 10 users at startup; unknown speakers are labelled automatically (`S1`, `S2`, …)
 - **Policy gating** — two modes: `ENROLLED` (pass only matched users) and `DYNAMIC` (pass a specific tracker label)
 - **Ultravox integration** — auto-creates a call via the Ultravox REST API and streams approved audio over a WebSocket; plays back the AI response in real time
-- **Apple Silicon optimised** — encoder runs on MPS (Metal Performance Shaders) for low-latency inference, with automatic CPU fallback
+- **Apple Silicon optimised** — encoder and extractor run on MPS (Metal Performance Shaders) for low-latency inference, with automatic CPU fallback
 - **Adaptive VAD** — energy + zero-crossing rate detector with configurable hangover; end-of-file flush ensures the last speech segment is never silently discarded
 - **File source mode** — run the full pipeline offline against a WAV file (`--source path/to/file.wav`) without a microphone
+- **Gatekeeper fallback** — disable extraction with `--set extractor.enabled=false` to revert to a lightweight accept/drop pipeline
 - **Robust WebSocket client** — retries connection up to 3 times; silence padding maintains stream continuity between speech segments
 - **Structured session logging** — every pipeline event is written to `logs/<session>.jsonl` for latency analysis and debugging
 
@@ -40,11 +42,13 @@ A real-time speaker-focused audio pipeline for Apple Silicon. PureSignal listens
 PureSignal/
 ├── src/                          # Pipeline source code
 │   ├── config.py                 # Backward-compat shim; re-exports constants from config/base.yaml
-│   ├── main.py                   # Pipeline orchestrator
+│   ├── main.py                   # Pipeline orchestrator (extractor + gatekeeper modes)
 │   ├── enroll.py                 # Standalone enrollment script
 │   ├── audio/
-│   │   ├── capture.py            # Mic input → ring buffer + frame queue
-│   │   ├── file_capture.py       # WAV file source; same frame_queue interface as capture.py
+│   │   ├── capture.py            # Mic input → ring buffer + frame/window queues
+│   │   ├── file_capture.py       # WAV file source; same queue interface as capture.py
+│   │   ├── extractor.py          # SpeakerBeam / Conv-TasNet target speaker extraction
+│   │   ├── window_buffer.py      # SlidingWindowBuffer + ResequencingBuffer for parallel extraction
 │   │   ├── features.py           # L2 peak normalization
 │   │   ├── resampler.py          # 16 kHz float32 → 48 kHz int16 PCM conversion
 │   │   └── vad.py                # Frame-level VAD with flush() for EOF
@@ -88,7 +92,17 @@ PureSignal/
 [mic | WAV file]
        │
        ▼
-[capture / file_capture] — 20ms float32 frames → frame_queue
+[capture / file_capture] — 20ms float32 frames
+       │
+       ▼
+[SlidingWindowBuffer] — assembles overlapping 1s windows → window_queue
+       │
+       ▼
+[extractor.py] — parallel SpeakerBeam workers conditioned on enrolled embedding
+                 ResequencingBuffer restores order from parallel workers
+       │
+       ▼
+cleaned audio frames (20ms slices)
        │
        ▼
 [vad.py] — energy + ZCR + hangover → complete speech segments
@@ -119,12 +133,13 @@ PureSignal/
 
 1. **Enroll** — `enroll.py` records N voice samples, quality-gates each embedding (norm + entropy), averages them, and saves to `profiles/<username>.npy` + `profiles/<username>_meta.json`.
 2. **Select users** — `main.py` prompts you to choose enrolled users (single or multi-user, up to 10) at startup.
-3. **Capture** — the mic streams 20ms frames continuously into a bounded queue (500 frames, ~10s) and a ring buffer.
-4. **VAD** — frames are accumulated into speech segments using energy and zero-crossing rate thresholds with a configurable hangover window. When a WAV file source reaches EOF, `vad.flush()` recovers any buffered segment that never saw trailing silence.
-5. **Embed** — each segment is normalized and passed through `pyannote/wespeaker-voxceleb-resnet34-LM` in a background thread to keep the main loop responsive.
-6. **Identify** — the embedding is compared against all enrolled profiles. Matched = username label; unmatched = tracker ID (`S1`, `S2`, …).
-7. **Gate** — segments from non-enrolled (or non-target) speakers are silently dropped.
-8. **Stream** — approved segments are resampled to 48 kHz int16 PCM and sent over a WebSocket to Ultravox, which responds in real time. Silence frames are sent between segments to keep the stream alive.
+3. **Capture** — the mic streams 20ms frames continuously into a bounded queue and a ring buffer. Frames are assembled into overlapping 1s windows for extraction.
+4. **Extract** — SpeakerBeam processes each window in parallel, conditioned on the enrolled speaker's 256-dim embedding fingerprint, suppressing all other voices. A `ResequencingBuffer` restores in-order output from the parallel workers.
+5. **VAD** — cleaned frames are accumulated into speech segments using energy and zero-crossing rate thresholds with a configurable hangover window. When a WAV file source reaches EOF, `vad.flush()` recovers any buffered segment that never saw trailing silence.
+6. **Embed** — each segment is normalized and passed through `pyannote/wespeaker-voxceleb-resnet34-LM` in a background thread to keep the main loop responsive.
+7. **Identify** — the embedding is compared against all enrolled profiles. Matched = username label; unmatched = tracker ID (`S1`, `S2`, …).
+8. **Gate** — segments from non-enrolled (or non-target) speakers are silently dropped.
+9. **Stream** — approved segments are resampled to 48 kHz int16 PCM and sent over a WebSocket to Ultravox, which responds in real time. Silence frames are sent between segments to keep the stream alive.
 
 ---
 
@@ -156,6 +171,8 @@ source .venv/bin/activate
 ```bash
 pip install -r requirements.txt
 ```
+
+> The `asteroid` package is required for speaker extraction. If you only need the lightweight gatekeeper mode, you can skip it and run with `--set extractor.enabled=false`.
 
 ### 4. Configure API keys
 
@@ -192,7 +209,7 @@ python3 src/enroll.py --samples 5
 python3 src/main.py
 ```
 
-On startup you will be prompted to choose a mode — **[1] Single-user** or **[2] Multi-user** (up to 10) — and enter enrolled usernames. The pipeline then initialises, connects to Ultravox, and begins listening.
+On startup you will be prompted to choose a mode — **[1] Single-user** or **[2] Multi-user** (up to 10) — and enter enrolled usernames. The pipeline then initialises, loads the extraction and encoder models, connects to Ultravox, and begins listening.
 
 Press `Ctrl+C` to stop cleanly. The pipeline shuts down in order: mic → WebSocket → VAD state → tracker state → log file.
 
@@ -204,6 +221,9 @@ python3 src/main.py --source path/to/file.wav --no-ultravox
 
 # Skip Ultravox entirely (offline / evaluation mode)
 python3 src/main.py --no-ultravox
+
+# Disable extraction and use the lightweight gatekeeper mode
+python3 src/main.py --set extractor.enabled=false
 
 # Override a config value at runtime
 python3 src/main.py --set vad.hangover_ms=300 --set debug=false
@@ -222,7 +242,7 @@ Tests run without any hardware (no microphone, GPU, or API keys required):
 pytest tests/ -v
 ```
 
-The test suite covers 32 cases across all core modules:
+The test suite covers cases across all core modules:
 
 | Module | Tests |
 |---|---|
@@ -266,10 +286,11 @@ python3 eval/latency_report.py --log logs/<session>.jsonl --plot
 
 | Check | Command / Action |
 |---|---|
-| Dependencies installed | `pip show pyannote.audio torch sounddevice` |
+| Dependencies installed | `pip show pyannote.audio torch sounddevice asteroid` |
 | HF token valid | `python3 -c "from huggingface_hub import whoami; print(whoami())"` |
 | Profiles exist | `ls profiles/` |
 | Encoder loads | Run `src/enroll.py` — watch for `[encoder] loading …` without errors |
+| Extractor loads | Run `src/main.py` — watch for `[extractor] ready — speakerbeam on mps` |
 | VAD fires | Run `src/main.py` with `debug: true` in `config/base.yaml` and speak — watch for `[vad] segment_closed` in the console |
 | Policy passing | Check `logs/<session>.jsonl` for `"event": "decision", "data": {"decision": "PASS"}` when the enrolled user speaks |
 | Ultravox connected | Watch for `[ultravox] connected` in the console after startup |
@@ -290,6 +311,12 @@ All settings live in [`config/base.yaml`](config/base.yaml). Override any value 
 | `vad.zcr_threshold` | `0.3` | Zero-crossing rate ceiling for speech frames |
 | `vad.hangover_ms` | `400` | Keep speech flag active N ms after energy drops |
 | `vad.noise_floor_init` | `0.01` | Initial noise floor estimate |
+| `extractor.enabled` | `true` | Set `false` to skip extraction and use gatekeeper mode |
+| `extractor.window_s` | `1.0` | Sliding window length fed to SpeakerBeam (s) |
+| `extractor.hop_s` | `0.25` | Window advance per step (s) — controls overlap |
+| `extractor.model` | `speakerbeam` | `speakerbeam` or `conv_tasnet` |
+| `extractor.device` | `mps` | Inference device (`mps` / `cpu`) |
+| `extractor.max_workers` | `2` | Parallel extraction futures in flight |
 | `encoder.model` | `pyannote/wespeaker-voxceleb-resnet34-LM` | HuggingFace model ID |
 | `encoder.device` | `mps` | Inference device (`mps` / `cpu`); falls back to CPU automatically |
 | `encoder.embedding_dim` | `256` | Speaker embedding dimensionality |
@@ -316,3 +343,4 @@ All settings live in [`config/base.yaml`](config/base.yaml). Override any value 
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+

@@ -19,10 +19,16 @@ _HANGOVER_FRAMES = int(config.HANGOVER_MS / config.FRAME_MS)
 
 
 def _rms(frame: np.ndarray) -> float:
+    """Return the root-mean-square energy of a single frame."""
     return float(np.sqrt(np.mean(frame**2)))
 
 
 def _zcr(frame: np.ndarray) -> float:
+    """Return the zero-crossing rate of a frame (crossings per sample).
+
+    High ZCR is characteristic of noise or unvoiced fricatives;
+    low ZCR combined with high energy signals voiced speech.
+    """
     signs = np.sign(frame)
     crossings = np.sum(np.abs(np.diff(signs))) / 2
     return float(crossings / len(frame))

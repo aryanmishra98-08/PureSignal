@@ -61,6 +61,12 @@ def record(duration_s: int, sample_index: int, total: int) -> np.ndarray:
 
 
 def prompt_username() -> str:
+    """
+    Interactively prompt for a username and return a sanitized version.
+
+    Only alphanumeric characters, hyphens, and underscores are kept.
+    Loops until the user supplies a non-empty valid name.
+    """
     while True:
         username = input("\n[enroll] Enter username for this profile: ").strip()
         if not username:
@@ -76,6 +82,16 @@ def prompt_username() -> str:
 
 
 def main() -> None:
+    """
+    Enrollment entry point.
+
+    Flow:
+      1. Parse --samples argument.
+      2. Prompt for a username; warn if a profile already exists.
+      3. Load the speaker encoder (downloads model on first run).
+      4. Record num_samples voice samples, extract embeddings, and run quality checks.
+      5. Average valid embeddings, re-normalize, and save .npy + _meta.json.
+    """
     args = _parse_args()
     num_samples = max(1, args.samples)
 

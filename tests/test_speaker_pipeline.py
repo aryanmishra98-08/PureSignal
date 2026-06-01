@@ -1,3 +1,11 @@
+# =============================================================================
+# tests/test_speaker_pipeline.py — Unit tests for the speaker ID stage
+#
+# Covers: speaker/enrollment.py, speaker/tracker.py, speaker/policy.py,
+#         speaker/encoder.py (token validation only — no model load)
+# No hardware or HuggingFace download required.
+# Run with: pytest tests/test_speaker_pipeline.py -v
+# =============================================================================
 import numpy as np
 import pytest
 from unittest.mock import patch
@@ -5,6 +13,7 @@ import config
 
 
 def _unit_vec(dim: int = 256, seed: int = 0) -> np.ndarray:
+    """Return a reproducible L2-normalized random vector of length `dim`."""
     rng = np.random.default_rng(seed)
     v = rng.standard_normal(dim).astype(np.float32)
     return v / np.linalg.norm(v)
