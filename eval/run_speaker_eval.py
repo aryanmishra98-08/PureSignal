@@ -23,51 +23,23 @@ import argparse
 import csv
 import json
 import sys
-import time
 from pathlib import Path
+
+import numpy as np
+from metrics import compute_eer, compute_far, compute_frr, det_curve
 
 _PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
-import numpy as np
-from metrics import compute_far, compute_frr, compute_eer, det_curve
-
-
-def _load_wav(path: Path) -> np.ndarray:
-    """Load a WAV as mono float32 at 16kHz."""
-    from scipy.io import wavfile
-    from scipy.signal import resample_poly
-    from math import gcd
-
-    import config
-    rate, data = wavfile.read(path)
-
-    if data.dtype == np.int16:
-        audio = data.astype(np.float32) / 32768.0
-    elif data.dtype == np.int32:
-        audio = data.astype(np.float32) / 2147483648.0
-    elif data.dtype == np.float64:
-        audio = data.astype(np.float32)
-    else:
-        audio = data.astype(np.float32)
-
-    if audio.ndim == 2:
-        audio = audio.mean(axis=1)
-
-    target = config.SAMPLE_RATE
-    if rate != target:
-        g = gcd(rate, target)
-        audio = resample_poly(audio, target // g, rate // g).astype(np.float32)
-
-    return audio
+from audio.wav_io import load_wav  # noqa: E402 — needs sys.path above
 
 
 def _embed_wav(path: Path) -> np.ndarray | None:
     from audio.features import normalize
     from speaker.encoder import embed
 
-    audio = _load_wav(path)
+    audio = load_wav(path)
     normalized = normalize(audio)
     return embed(normalized)
 
@@ -87,10 +59,14 @@ def _collect_wavs(directory: Path) -> dict[str, list[Path]]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Speaker verification FAR/FRR/EER evaluation")
-    parser.add_argument("--enrolled-dir", required=True, help="Path to profiles/ directory")
-    parser.add_argument("--test-dir", required=True, help="Path to test WAV directory (speaker/utterance.wav)")
-    parser.add_argument("--imposters-dir", required=True, help="Path to impostor WAV directory")
+    parser = argparse.ArgumentParser(
+        description="Speaker verification FAR/FRR/EER evaluation")
+    parser.add_argument("--enrolled-dir", required=True,
+                        help="Path to profiles/ directory")
+    parser.add_argument("--test-dir", required=True,
+                        help="Path to test WAV directory (speaker/utterance.wav)")
+    parser.add_argument("--imposters-dir", required=True,
+                        help="Path to impostor WAV directory")
     parser.add_argument(
         "--threshold-sweep",
         nargs="+",
@@ -98,7 +74,8 @@ def main() -> None:
         default=[0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9],
         help="Threshold values to evaluate",
     )
-    parser.add_argument("--out", default="eval/results/speaker_eval", help="Output directory")
+    parser.add_argument(
+        "--out", default="eval/results/speaker_eval", help="Output directory")
     args = parser.parse_args()
 
     enrolled_dir = Path(args.enrolled_dir)
@@ -117,7 +94,8 @@ def main() -> None:
     from speaker.enrollment import load_profiles
     enrolled_names = [p.stem for p in sorted(enrolled_dir.glob("*.npy"))]
     if not enrolled_names:
-        print(f"[run_speaker_eval] ERROR: no .npy files found in {enrolled_dir}")
+        print(
+            f"[run_speaker_eval] ERROR: no .npy files found in {enrolled_dir}")
         sys.exit(1)
     load_profiles(enrolled_names)
 
@@ -130,7 +108,8 @@ def main() -> None:
     labels: list[int] = []
     rows: list[dict] = []
 
-    print(f"[run_speaker_eval] embedding {sum(len(v) for v in test_by_speaker.values())} test utterances...")
+    n_test = sum(len(v) for v in test_by_speaker.values())
+    print(f"[run_speaker_eval] embedding {n_test} test utterances...")
     from speaker.enrollment import match_with_score
     for speaker_name, wavs in test_by_speaker.items():
         for wav_path in wavs:
@@ -150,7 +129,8 @@ def main() -> None:
                 "similarity": best_sim,
             })
 
-    print(f"[run_speaker_eval] embedding {sum(len(v) for v in impostor_by_speaker.values())} impostor utterances...")
+    n_imp = sum(len(v) for v in impostor_by_speaker.values())
+    print(f"[run_speaker_eval] embedding {n_imp} impostor utterances...")
     for speaker_name, wavs in impostor_by_speaker.items():
         for wav_path in wavs:
             emb = _embed_wav(wav_path)
@@ -173,7 +153,8 @@ def main() -> None:
     # Write raw scores CSV
     scores_csv = out_dir / "scores.csv"
     with open(scores_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["utterance", "speaker", "label", "similarity"])
+        writer = csv.DictWriter(
+            f, fieldnames=["utterance", "speaker", "label", "similarity"])
         writer.writeheader()
         writer.writerows(rows)
     print(f"[run_speaker_eval] scores → {scores_csv}")
@@ -215,8 +196,10 @@ def main() -> None:
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(6, 6))
-        ax.plot([f * 100 for f in far_vals], [f * 100 for f in frr_vals], color="steelblue")
-        ax.plot([eer_val * 100], [eer_val * 100], "ro", label=f"EER={eer_val*100:.1f}%")
+        ax.plot([f * 100 for f in far_vals],
+                [f * 100 for f in frr_vals], color="steelblue")
+        ax.plot([eer_val * 100], [eer_val * 100],
+                "ro", label=f"EER={eer_val*100:.1f}%")
         ax.set_xlabel("FAR (%)")
         ax.set_ylabel("FRR (%)")
         ax.set_title("Detection Error Tradeoff (DET) Curve")

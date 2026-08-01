@@ -1,0 +1,69 @@
+# =============================================================================
+# config/container.yaml — Overrides for the Docker image.
+#
+# The container is for offline file-mode evaluation only: no microphone, no
+# MPS, no Ultravox playback.  Loaded with:
+#   python src/main.py --config config/container.yaml --source /data/x.wav
+#
+# This is a FULL config, not a patch: --config replaces base.yaml rather than
+# merging with it.  Keep it in sync when adding keys to base.yaml.
+# =============================================================================
+
+audio:
+  sample_rate: 16000
+  frame_ms: 20
+
+vad:
+  energy_multiplier: 3.0
+  zcr_threshold: 0.3
+  hangover_ms: 400
+  noise_floor_init: 0.01
+  noise_floor_min_ratio: 0.1
+  max_segment_s: 30
+
+extractor:
+  enabled: false # no verified separator budget on container CPU
+  window_s: 1.0
+  hop_s: 0.25
+  model: conv_tasnet
+  checkpoint: JorisCos/ConvTasNet_Libri2Mix_sepnoisy_16k
+  device: cpu # no MPS on Linux
+  max_workers: 2
+  reanchor_every: 8
+  log_every: 20
+  startup_check: true
+
+encoder:
+  model: pyannote/wespeaker-voxceleb-resnet34-LM
+  device: cpu # no MPS on Linux
+  min_segment_s: 0.5
+  max_pending_segments: 3
+
+tracker:
+  similarity_threshold: 0.65
+  ema_alpha: 0.25
+  max_speakers: 4
+
+enrollment:
+  threshold: 0.65
+  duration_s: 12
+  num_samples: 3
+
+policy:
+  mode: ENROLLED
+  dynamic_target: S1
+
+ultravox:
+  in_rate: 48000
+  out_rate: 48000
+  chunk_ms: 20
+  join_url: ""
+  system_prompt: "You are a helpful assistant."
+
+internal:
+  norm_floor: 1.0e-6
+  noise_floor_ema_fast: 0.05
+  noise_floor_ema_slow: 0.95
+
+random_seed: 42
+debug: false

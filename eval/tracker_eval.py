@@ -22,43 +22,19 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
+
 _PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
-import numpy as np
-
-
-def _load_wav(path: Path) -> np.ndarray:
-    from scipy.io import wavfile
-    from scipy.signal import resample_poly
-    from math import gcd
-    import config
-
-    rate, data = wavfile.read(path)
-    if data.dtype == np.int16:
-        audio = data.astype(np.float32) / 32768.0
-    elif data.dtype == np.int32:
-        audio = data.astype(np.float32) / 2147483648.0
-    elif data.dtype == np.float64:
-        audio = data.astype(np.float32)
-    else:
-        audio = data.astype(np.float32)
-
-    if audio.ndim == 2:
-        audio = audio.mean(axis=1)
-
-    target = config.SAMPLE_RATE
-    if rate != target:
-        g = gcd(rate, target)
-        audio = resample_poly(audio, target // g, rate // g).astype(np.float32)
-    return audio
+from audio.wav_io import load_wav  # noqa: E402 — needs sys.path above
 
 
 def _embed_wav(path: Path) -> np.ndarray | None:
     from audio.features import normalize
     from speaker.encoder import embed
-    audio = _load_wav(path)
+    audio = load_wav(path)
     return embed(normalize(audio))
 
 
@@ -81,7 +57,8 @@ def _compute_purity(assignments: list[tuple[str, str]]) -> float:
 def _build_confusion(assignments: list[tuple[str, str]]) -> dict:
     true_labels = sorted({t for t, _ in assignments})
     assigned_ids = sorted({a for _, a in assignments})
-    matrix: dict[str, dict[str, int]] = {t: {a: 0 for a in assigned_ids} for t in true_labels}
+    matrix: dict[str, dict[str, int]] = {
+        t: {a: 0 for a in assigned_ids} for t in true_labels}
     for true_label, assigned_id in assignments:
         matrix[true_label][assigned_id] += 1
     return {"true_labels": true_labels, "assigned_ids": assigned_ids, "matrix": matrix}
@@ -89,13 +66,15 @@ def _build_confusion(assignments: list[tuple[str, str]]) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Tracker purity evaluation")
-    parser.add_argument("--session-dir", required=True, help="Directory: speaker_id/utterance_N.wav")
+    parser.add_argument("--session-dir", required=True,
+                        help="Directory: speaker_id/utterance_N.wav")
     parser.add_argument(
         "--sequence",
         required=True,
         help="Space-separated order of speaker labels, e.g. 'A B A B C A'",
     )
-    parser.add_argument("--out", default="eval/results/tracker_eval", help="Output directory")
+    parser.add_argument(
+        "--out", default="eval/results/tracker_eval", help="Output directory")
     args = parser.parse_args()
 
     session_dir = Path(args.session_dir)
@@ -118,12 +97,13 @@ def main() -> None:
         speaker_wavs[speaker_id] = wavs
 
     # Cycling iterator: if fewer utterances than sequence calls, wrap around
-    speaker_iters = {sid: iter(wavs * (len(sequence) // len(wavs) + 1)) for sid, wavs in speaker_wavs.items()}
+    speaker_iters = {sid: iter(wavs * (len(sequence) // len(wavs) + 1))
+                     for sid, wavs in speaker_wavs.items()}
 
     # Load encoder and reset tracker
     print("[tracker_eval] loading encoder...")
     from speaker.encoder import load_encoder
-    from speaker.tracker import assign, reset, get_gallery
+    from speaker.tracker import assign, get_gallery, reset
     load_encoder()
     reset()
 
@@ -135,7 +115,8 @@ def main() -> None:
         wav_path = next(speaker_iters[true_label])
         emb = _embed_wav(wav_path)
         if emb is None:
-            print(f"  [step {step}] {true_label}: {wav_path.name} too short — skipped")
+            print(
+                f"  [step {step}] {true_label}: {wav_path.name} too short — skipped")
             continue
 
         assigned_id = assign(emb)
@@ -147,7 +128,8 @@ def main() -> None:
             "utterance": wav_path.name,
             "gallery_size": len(get_gallery()),
         })
-        print(f"  step {step:2d}: true={true_label}  assigned={assigned_id}  {'OK' if assigned_id else ''}")
+        print(f"  step {step:2d}: true={true_label}  assigned={assigned_id}  "
+              f"{'OK' if assigned_id else ''}")
 
     purity = _compute_purity(assignments)
     confusion = _build_confusion(assignments)
@@ -163,17 +145,19 @@ def main() -> None:
     with open(out_json, "w") as f:
         json.dump(results, f, indent=2)
 
-    print(f"\n  Tracker purity: {purity * 100:.1f}%  ({len(assignments)} assignments)")
+    print(
+        f"\n  Tracker purity: {purity * 100:.1f}%  ({len(assignments)} assignments)")
     print(f"  Results → {out_json}\n")
 
     # Timeline plot
     try:
-        import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
+        import matplotlib.pyplot as plt
 
         true_labels_sorted = sorted({t for t, _ in assignments})
         assigned_ids_sorted = sorted({a for _, a in assignments})
-        label_colors = {l: f"C{i}" for i, l in enumerate(true_labels_sorted)}
+        label_colors = {lbl: f"C{i}" for i,
+                        lbl in enumerate(true_labels_sorted)}
         assigned_to_int = {a: i for i, a in enumerate(assigned_ids_sorted)}
 
         fig, ax = plt.subplots(figsize=(max(8, len(assignments) * 0.4), 4))
@@ -187,7 +171,8 @@ def main() -> None:
         ax.set_xlabel("Utterance step")
         ax.set_ylabel("Tracker assignment")
         ax.set_title(f"Speaker tracker timeline  (purity={purity*100:.1f}%)")
-        legend_handles = [mpatches.Patch(color=c, label=l) for l, c in label_colors.items()]
+        legend_handles = [mpatches.Patch(color=c, label=lbl)
+                          for lbl, c in label_colors.items()]
         ax.legend(handles=legend_handles, title="True speaker")
         ax.grid(True, axis="x", alpha=0.3)
         fig.tight_layout()

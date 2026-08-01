@@ -3,9 +3,10 @@
 #                      Used immediately before WebSocket send
 # =============================================================================
 
-import config
 import numpy as np
 from scipy.signal import resample_poly
+
+import config
 
 # Resample ratio: 48000 / 16000 = 3/1
 _UP = 3

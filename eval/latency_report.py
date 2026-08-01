@@ -67,11 +67,37 @@ def load_latency_records(log_path: Path) -> list[dict]:
     return records
 
 
+def load_drop_counts(log_path: Path) -> dict[str, int]:
+    """
+    Count work that never produced a latency record.
+
+    A percentile table computed only over delivered segments is survivorship-
+    biased: the slowest work is exactly what gets dropped. These counts are what
+    make the table honest.
+    """
+    counts = {"segment_dropped": 0, "window_dropped": 0, "frame_dropped": 0,
+              "send_dropped": 0, "segment_too_short": 0, "sequence_skipped": 0}
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            event = entry.get("event")
+            if event in counts:
+                if event == "sequence_skipped":
+                    counts[event] += int(entry.get("data", {}).get("count", 1))
+                else:
+                    counts[event] += 1
+    return counts
+
+
 def compute_report(records: list[dict]) -> list[StageStats]:
     encoder_ms: list[float] = []
     policy_ms: list[float] = []
     send_ms: list[float] = []
     e2e_ms: list[float] = []
+    onset_ms: list[float] = []
 
     for r in records:
         enc_start = r.get("encoder_start_ts")
@@ -79,6 +105,7 @@ def compute_report(records: list[dict]) -> list[StageStats]:
         policy_ts = r.get("policy_ts")
         send_ts = r.get("send_ts")
         vad_close = r.get("vad_close_ts")
+        seg_start = r.get("segment_start_ts")
 
         if enc_start and enc_done:
             encoder_ms.append((enc_done - enc_start) * 1000)
@@ -88,22 +115,45 @@ def compute_report(records: list[dict]) -> list[StageStats]:
             send_ms.append((send_ts - policy_ts) * 1000)
         if vad_close and send_ts:
             e2e_ms.append((send_ts - vad_close) * 1000)
+        if seg_start and send_ts:
+            onset_ms.append((send_ts - seg_start) * 1000)
 
     return [
         _stats("encoder", encoder_ms),
         _stats("policy", policy_ms),
         _stats("send", send_ms),
-        _stats("end_to_end", e2e_ms),
+        _stats("vad_close_to_send", e2e_ms),
+        _stats("speech_onset_to_send", onset_ms),
     ]
 
 
 def print_report(stats: list[StageStats]) -> None:
-    print(f"\n{'Stage':<14} {'P50 ms':>8} {'P95 ms':>8} {'P99 ms':>8} {'Mean ms':>9} {'N':>6}")
-    print("-" * 58)
+    print(
+        f"\n{'Stage':<22} {'P50 ms':>8} {'P95 ms':>8} {'P99 ms':>8} {'Mean ms':>9} {'N':>6}")
+    print("-" * 66)
     for s in stats:
         print(
-            f"{s.name:<14} {s.p50:>8.1f} {s.p95:>8.1f} {s.p99:>8.1f} {s.mean:>9.1f} {s.count:>6}"
+            f"{s.name:<22} {s.p50:>8.1f} {s.p95:>8.1f} {s.p99:>8.1f} {s.mean:>9.1f} {s.count:>6}"
         )
+    print("\nCovers delivered segments only. speech_onset_to_send is the "
+          "user-perceived\nfigure; vad_close_to_send excludes the segment's own "
+          "duration.")
+
+
+def print_drops(counts: dict[str, int], delivered: int) -> None:
+    """Report work that never reached the percentile table."""
+    total = sum(counts.values())
+    print(f"\n{'Dropped / unmeasured':<22} {'count':>8}")
+    print("-" * 32)
+    for name, n in counts.items():
+        print(f"{name:<22} {n:>8}")
+    accounted = delivered + total
+    pct = (total / accounted * 100) if accounted else 0.0
+    print("-" * 32)
+    print(f"{'total dropped':<22} {total:>8}  ({pct:.1f}% of all work)")
+    if total:
+        print("\nWARNING: dropped work contributes no latency record, so the "
+              "percentiles\nabove are biased optimistic.")
     print()
 
 
@@ -116,10 +166,11 @@ def plot_histogram(records: list[dict], output_path: Path) -> None:
 
     e2e_ms = []
     for r in records:
-        vad_close = r.get("vad_close_ts")
+        # Prefer the onset-based span — it is what the user actually waits.
+        start = r.get("segment_start_ts") or r.get("vad_close_ts")
         send_ts = r.get("send_ts")
-        if vad_close and send_ts:
-            e2e_ms.append((send_ts - vad_close) * 1000)
+        if start and send_ts:
+            e2e_ms.append((send_ts - start) * 1000)
 
     if not e2e_ms:
         print("[latency_report] no end-to-end records to plot")
@@ -127,11 +178,13 @@ def plot_histogram(records: list[dict], output_path: Path) -> None:
 
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.hist(e2e_ms, bins=30, edgecolor="white", color="steelblue")
-    ax.axvline(_percentile(e2e_ms, 50), color="orange", linestyle="--", label="P50")
-    ax.axvline(_percentile(e2e_ms, 95), color="red", linestyle="--", label="P95")
-    ax.set_xlabel("End-to-end latency (ms)")
+    ax.axvline(_percentile(e2e_ms, 50), color="orange",
+               linestyle="--", label="P50")
+    ax.axvline(_percentile(e2e_ms, 95), color="red",
+               linestyle="--", label="P95")
+    ax.set_xlabel("Speech onset → send (ms)")
     ax.set_ylabel("Segments")
-    ax.set_title("Pipeline end-to-end latency distribution")
+    ax.set_title("Pipeline latency distribution (delivered segments)")
     ax.legend()
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
@@ -139,9 +192,12 @@ def plot_histogram(records: list[dict], output_path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Latency report from session JSONL log")
-    parser.add_argument("--log", required=True, metavar="PATH", help="Path to session .jsonl log")
-    parser.add_argument("--plot", action="store_true", help="Save histogram PNG alongside the report")
+    parser = argparse.ArgumentParser(
+        description="Latency report from session JSONL log")
+    parser.add_argument("--log", required=True, metavar="PATH",
+                        help="Path to session .jsonl log")
+    parser.add_argument("--plot", action="store_true",
+                        help="Save histogram PNG alongside the report")
     args = parser.parse_args()
 
     log_path = Path(args.log)
@@ -154,9 +210,11 @@ def main() -> None:
         print("[latency_report] no latency_record entries found in log")
         sys.exit(1)
 
-    print(f"[latency_report] {len(records)} segments from '{log_path.name}'")
+    print(
+        f"[latency_report] {len(records)} delivered segments from '{log_path.name}'")
     stats = compute_report(records)
     print_report(stats)
+    print_drops(load_drop_counts(log_path), delivered=len(records))
 
     if args.plot:
         plot_path = log_path.with_suffix(".latency.png")

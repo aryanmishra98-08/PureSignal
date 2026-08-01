@@ -212,3 +212,15 @@ load_env.ps1
 # Ignore all profile embeddings — re-enroll on each machine
 **/profiles/*.npy
 **/profiles/*.json
+
+############################
+# Evaluation corpus
+############################
+# Audio is not redistributable — rebuild it per eval/README.md
+eval/test_audio/
+eval/imposters/
+eval/vad_audio/
+eval/vad_labels/
+eval/tracker_audio/
+# Results ARE committed: metrics.json, *.png, *.csv under eval/results/
+!eval/results/

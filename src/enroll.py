@@ -15,12 +15,13 @@ import argparse
 import sys
 import time
 
-import config
 import numpy as np
 import sounddevice as sd
+
+import config
 from audio import features
 from speaker import encoder
-from speaker.enrollment import validate_enrollment_quality, save_with_metadata
+from speaker.enrollment import save_with_metadata, validate_enrollment_quality
 
 
 def _parse_args() -> argparse.Namespace:
@@ -38,7 +39,8 @@ def _parse_args() -> argparse.Namespace:
 def record(duration_s: int, sample_index: int, total: int) -> np.ndarray:
     """Blocking mic record for duration_s seconds. Returns float32 array."""
     total_samples = duration_s * config.SAMPLE_RATE
-    print(f"\n[enroll] Sample {sample_index}/{total} — Recording for {duration_s}s. Speak naturally...\n")
+    print(f"\n[enroll] Sample {sample_index}/{total} — "
+          f"Recording for {duration_s}s. Speak naturally...\n")
 
     try:
         buffer = sd.rec(
@@ -68,7 +70,8 @@ def prompt_username() -> str:
     Loops until the user supplies a non-empty valid name.
     """
     while True:
-        username = input("\n[enroll] Enter username for this profile: ").strip()
+        username = input(
+            "\n[enroll] Enter username for this profile: ").strip()
         if not username:
             print("  Username cannot be empty. Try again.")
             continue
@@ -105,7 +108,8 @@ def main() -> None:
 
     if output_path.exists():
         overwrite = (
-            input(f"\n  Profile '{username}' already exists. Overwrite? [y/N]: ")
+            input(
+                f"\n  Profile '{username}' already exists. Overwrite? [y/N]: ")
             .strip()
             .lower()
         )
@@ -125,10 +129,12 @@ def main() -> None:
 
     for i in range(1, num_samples + 1):
         while True:
-            audio = record(config.ENROLLMENT_DURATION_S, sample_index=i, total=num_samples)
+            audio = record(config.ENROLLMENT_DURATION_S,
+                           sample_index=i, total=num_samples)
             normalized = features.normalize(audio)
 
-            print(f"[enroll] Extracting embedding for sample {i}/{num_samples}...")
+            print(
+                f"[enroll] Extracting embedding for sample {i}/{num_samples}...")
             emb = encoder.embed(normalized)
 
             if emb is None:
@@ -152,9 +158,11 @@ def main() -> None:
                 if not quality["quality_pass"]:
                     print(
                         "\n[enroll] WARNING: Low-quality embedding detected.\n"
-                        "  Possible causes: background noise, too-quiet recording, or short silence.\n"
+                        "  Possible causes: background noise, too-quiet "
+                        "recording, or short silence.\n"
                     )
-                    retry = input("  Re-record this sample? [Y/n]: ").strip().lower()
+                    retry = input(
+                        "  Re-record this sample? [Y/n]: ").strip().lower()
                     if retry != "n":
                         continue
                 embeddings.append(emb)

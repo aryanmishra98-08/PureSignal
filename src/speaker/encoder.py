@@ -8,14 +8,23 @@
 # =============================================================================
 
 import os
-import config
+import threading
+
 import numpy as np
 import torch
 from pyannote.audio import Inference, Model
 
+import config
+
 _model = None
 _inference = None
 _device: str = ""
+
+# pyannote.audio.Inference makes no documented thread-safety guarantee and the
+# torch module underneath is shared mutable state.  The pipeline routes encoder
+# work through a single-worker pool, but this lock is cheap insurance against a
+# second caller (e.g. extractor source re-anchoring) arriving concurrently.
+_embed_lock = threading.Lock()
 
 
 def _resolve_device() -> str:
@@ -86,7 +95,7 @@ def embed(segment: np.ndarray) -> np.ndarray | None:
         "sample_rate": config.SAMPLE_RATE,
     }
 
-    with torch.no_grad():
+    with _embed_lock, torch.no_grad():
         embedding = _inference(input_dict)  # np.ndarray [256]
 
     # L2 normalize

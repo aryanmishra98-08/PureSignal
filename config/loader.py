@@ -87,7 +87,8 @@ def load_config(path=None, overrides=None, set_args=None):
     if set_args:
         for arg in set_args:
             if "=" not in arg:
-                raise ValueError(f"--set argument must be key=value, got: '{arg}'")
+                raise ValueError(
+                    f"--set argument must be key=value, got: '{arg}'")
             key, _, value = arg.partition("=")
             _apply_dotted_override(raw, key.strip(), value.strip())
     return Config(raw)

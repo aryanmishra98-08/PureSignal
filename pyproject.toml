@@ -35,7 +35,14 @@ testpaths = ["tests"]
 
 [tool.ruff]
 src = ["src"]
+line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
-per-file-ignores = {}
+
+[tool.ruff.lint.per-file-ignores]
+# eval scripts bootstrap sys.path before importing pipeline modules, so their
+# imports genuinely cannot all sit at the top of the file.
+"eval/*.py" = ["E402"]
+# conftest.py exists to manipulate sys.path.
+"tests/conftest.py" = ["E402"]

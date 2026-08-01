@@ -6,10 +6,13 @@
 # No hardware or HuggingFace download required.
 # Run with: pytest tests/test_speaker_pipeline.py -v
 # =============================================================================
+from unittest.mock import patch
+
 import numpy as np
 import pytest
-from unittest.mock import patch
+
 import config
+from speaker import encoder, enrollment, policy, tracker
 
 
 def _unit_vec(dim: int = 256, seed: int = 0) -> np.ndarray:
@@ -30,8 +33,6 @@ def _orthogonal_vec(v: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # speaker/enrollment.py tests
 # ---------------------------------------------------------------------------
-
-from speaker import enrollment
 
 
 def test_enrollment_load_match(tmp_path, monkeypatch):
@@ -101,7 +102,8 @@ def test_enrollment_validate_quality_zero_vector_fails():
 def test_enrollment_save_with_metadata_writes_npy_and_json(tmp_path):
     emb = _unit_vec(seed=6)
     quality = enrollment.validate_enrollment_quality(emb)
-    enrollment.save_with_metadata(emb, "eve", tmp_path, num_samples=3, quality=quality)
+    enrollment.save_with_metadata(
+        emb, "eve", tmp_path, num_samples=3, quality=quality)
 
     npy_path = tmp_path / "eve.npy"
     meta_path = tmp_path / "eve_meta.json"
@@ -123,8 +125,6 @@ def test_enrollment_save_with_metadata_writes_npy_and_json(tmp_path):
 # speaker/tracker.py tests
 # ---------------------------------------------------------------------------
 
-from speaker import tracker
-
 
 def test_tracker_first_speaker_is_S1():
     tracker.reset()
@@ -137,7 +137,8 @@ def test_tracker_same_speaker_stable():
     emb = _unit_vec(seed=11)
     sid1 = tracker.assign(emb)
     # Slightly perturbed version — should still be same speaker
-    perturbed = emb + np.random.default_rng(0).standard_normal(256).astype(np.float32) * 0.01
+    perturbed = emb + \
+        np.random.default_rng(0).standard_normal(256).astype(np.float32) * 0.01
     perturbed /= np.linalg.norm(perturbed)
     sid2 = tracker.assign(perturbed)
     assert sid1 == sid2 == "S1"
@@ -210,8 +211,6 @@ def test_tracker_ema_centroid_shifts_toward_new_embedding():
 # speaker/policy.py tests
 # ---------------------------------------------------------------------------
 
-from speaker import policy
-
 
 def test_policy_enrolled_pass(monkeypatch):
     monkeypatch.setattr(config, "POLICY_MODE", "ENROLLED")
@@ -246,8 +245,6 @@ def test_policy_invalid_mode_raises(monkeypatch):
 # ---------------------------------------------------------------------------
 # speaker/encoder.py tests (token validation only — no model load)
 # ---------------------------------------------------------------------------
-
-from speaker import encoder
 
 
 def test_encoder_hf_token_missing_raises(monkeypatch):

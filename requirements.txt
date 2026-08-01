@@ -40,5 +40,9 @@ matplotlib>=3.8.0
 textgrid>=1.5.0
 requests>=2.31.0
 
-# Target speaker extraction — new in v2
+# Target speaker separation (Conv-TasNet) — extractor mode only.
+# Optional: run gatekeeper mode with `--set extractor.enabled=false` and this is
+# never imported. Note asteroid pins an older torch range than the one above, so
+# installing it may downgrade torch; install it in a separate environment if that
+# matters. There is no SpeakerBeam in asteroid — see PHASE0_FINDINGS.md.
 asteroid>=0.6.0

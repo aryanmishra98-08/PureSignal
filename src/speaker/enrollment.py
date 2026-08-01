@@ -10,8 +10,9 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import config
 import numpy as np
+
+import config
 
 # Maps username -> normalized embedding
 _enrolled: dict[str, np.ndarray] = {}
@@ -123,7 +124,3 @@ def save_with_metadata(
     }
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
-
-
-def is_loaded() -> bool:
-    return len(_enrolled) > 0

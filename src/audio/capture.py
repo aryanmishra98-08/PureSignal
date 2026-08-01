@@ -8,93 +8,74 @@
 #       Consumers: vad.process_frame() in _process_loop_gatekeeper.
 #
 #   window_queue  (extractor mode, extractor.enabled = true)
-#       Overlapping 1s windows emitted by SlidingWindowBuffer as
-#       (seq_no, np.ndarray) tuples, ready for parallel SpeakerBeam workers.
+#       Overlapping windows as (seq_no, window, new_samples) tuples, ready for
+#       parallel extraction workers.
 #       Consumers: _process_loop_extractor via ResequencingBuffer.
 #
-# Changes from v1:
-#   - Adds window_queue for extractor mode (SlidingWindowBuffer → (seq, window) tuples)
-#   - frame_queue retained for gatekeeper mode (extractor.enabled = false)
+# Routing itself lives in audio/windowed_source.py so that the mic and the WAV
+# replay thread share one implementation.  Nothing here reads config at import
+# time — init() is called by the pipeline after any --set overrides are bound.
 # =============================================================================
 import queue
-from collections import deque
-import config
+
 import numpy as np
-import sounddevice as sd
+
+import config
+from audio.windowed_source import WindowedSource
+
+# sounddevice is imported lazily inside the mic entry points. It requires
+# PortAudio at import time, which file-mode and container runs do not have and
+# do not need.
 
 # Both queues are module-level so file_capture.py can share the same objects.
-frame_queue: queue.Queue = queue.Queue(maxsize=500)   # gatekeeper mode — raw 20ms frames
-window_queue: queue.Queue = queue.Queue(maxsize=100)  # extractor mode — (seq, window) tuples
+frame_queue: queue.Queue = queue.Queue(
+    maxsize=500)   # gatekeeper mode — raw 20ms frames
+window_queue: queue.Queue = queue.Queue(
+    maxsize=100)  # extractor mode — window tuples
 
-# Rolling snapshot of the last WINDOW_SIZE_S seconds (used by get_ring_snapshot)
-_ring_buffer = deque(maxlen=int(config.WINDOW_SIZE_S * config.SAMPLE_RATE))
+_source: WindowedSource | None = None
 
-# SlidingWindowBuffer instance — created at import time if extractor is enabled
-_win_buf = None
-if config.EXTRACTOR_ENABLED:
-    from audio.window_buffer import SlidingWindowBuffer
-    _win_buf = SlidingWindowBuffer()
+
+def get_source() -> WindowedSource:
+    """
+    Return the routing layer, constructing it on first use.
+
+    Construction is deferred rather than done at import time: which queue is
+    used depends on config.EXTRACTOR_ENABLED, which must be read after any
+    --set overrides are applied.  Idempotent.
+    """
+    global _source
+    if _source is None:
+        _source = WindowedSource(window_queue, frame_queue)
+    return _source
 
 
 def _capture_callback(indata: np.ndarray, frames: int, time_info, status) -> None:
     """
     sounddevice callback — called on the audio thread for every captured block.
 
-    Routing logic:
-      - Always extend the ring buffer (for get_ring_snapshot).
-      - Extractor mode: push frame into SlidingWindowBuffer; emit window when ready.
-      - Gatekeeper mode: push raw frame directly to frame_queue.
-
-    Dropped frames (full queues) are silently discarded to avoid blocking the
-    audio thread, which would cause underruns.
+    Hands the frame to WindowedSource, which routes it to the queue matching the
+    active pipeline mode.  Never blocks: full queues drop rather than stall the
+    audio thread, which would cause input underruns.  Drops are logged.
     """
     if status:
         print(f"[capture] sounddevice status: {status}")
     frame = indata[:, 0].copy()  # mono: take first channel
-    _ring_buffer.extend(frame)
-    if _win_buf is not None:
-        # Extractor path — buffer accumulates frames until a full window is ready
-        result = _win_buf.push(frame)
-        if result is not None:
-            try:
-                window_queue.put_nowait(result)
-            except queue.Full:
-                pass  # drop window rather than stall the audio thread
-    else:
-        # Gatekeeper path — pass raw frame straight through
-        try:
-            frame_queue.put_nowait(frame)
-        except queue.Full:
-            pass
+    get_source().push_frame(frame)
 
 
 def flush_window_buffer() -> None:
     """
-    Flush any buffered audio at end-of-stream and push a None sentinel.
+    Flush buffered audio at end-of-stream and push the None sentinel.
 
-    Call this after the audio source stops to signal downstream consumers
-    to finalize their processing loops.  The sentinel is pushed to whichever
-    queue is active (window_queue or frame_queue).
+    Called by the pipeline shutdown path so that mic mode gets the same clean
+    end-of-stream handling as file mode, instead of relying on the process
+    exiting out from under the consumer loop.
     """
-    if _win_buf is not None:
-        result = _win_buf.flush()
-        if result is not None:
-            try:
-                window_queue.put(result, timeout=2)
-            except queue.Full:
-                pass
-        try:
-            window_queue.put(None, timeout=2)  # EOF sentinel
-        except queue.Full:
-            pass
-    else:
-        try:
-            frame_queue.put(None, timeout=2)  # EOF sentinel
-        except queue.Full:
-            pass
+    get_source().close()
 
 
-def start_capture() -> sd.InputStream:
+def start_capture():
     """
     Open and start the default microphone input stream.
 
@@ -102,8 +83,16 @@ def start_capture() -> sd.InputStream:
         sd.InputStream — the active stream; pass to stop_capture() to close it.
 
     Raises:
-        RuntimeError if PortAudio cannot open the microphone.
+        RuntimeError if PortAudio is unavailable or cannot open the microphone.
     """
+    get_source()
+    try:
+        import sounddevice as sd
+    except OSError as e:
+        raise RuntimeError(
+            f"[capture] PortAudio is unavailable, so mic capture is not "
+            f"possible: {e}\n  Use --source path/to/file.wav instead."
+        ) from e
     try:
         stream = sd.InputStream(
             samplerate=config.SAMPLE_RATE,
@@ -122,13 +111,16 @@ def start_capture() -> sd.InputStream:
     return stream
 
 
-def stop_capture(stream: sd.InputStream) -> None:
+def stop_capture(stream) -> None:
     """Stop and close the microphone stream opened by start_capture()."""
     stream.stop()
     stream.close()
     print("[capture] mic closed")
 
 
-def get_ring_snapshot() -> np.ndarray:
-    """Return a float32 copy of the ring buffer — the last WINDOW_SIZE_S seconds of audio."""
-    return np.array(_ring_buffer, dtype=np.float32)
+def reset() -> None:
+    """Drop the routing layer so the next session rebuilds it from live config."""
+    global _source
+    if _source is not None:
+        _source.reset()
+    _source = None

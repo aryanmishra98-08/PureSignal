@@ -3,8 +3,9 @@
 #                     Normalization only — mel extraction handled by encoder
 # =============================================================================
 
-import config
 import numpy as np
+
+import config
 
 
 def normalize(segment: np.ndarray) -> np.ndarray:

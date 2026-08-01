@@ -11,12 +11,10 @@ Functions:
 
 from __future__ import annotations
 
-import math
-
 
 def compute_far(scores: list[float], labels: list[int], threshold: float) -> float:
     """False Accept Rate: fraction of impostors accepted (score >= threshold)."""
-    impostors = [(s, l) for s, l in zip(scores, labels) if l == 0]
+    impostors = [(s, lab) for s, lab in zip(scores, labels) if lab == 0]
     if not impostors:
         return 0.0
     accepted = sum(1 for s, _ in impostors if s >= threshold)
@@ -25,7 +23,7 @@ def compute_far(scores: list[float], labels: list[int], threshold: float) -> flo
 
 def compute_frr(scores: list[float], labels: list[int], threshold: float) -> float:
     """False Reject Rate: fraction of genuine pairs rejected (score < threshold)."""
-    genuines = [(s, l) for s, l in zip(scores, labels) if l == 1]
+    genuines = [(s, lab) for s, lab in zip(scores, labels) if lab == 1]
     if not genuines:
         return 0.0
     rejected = sum(1 for s, _ in genuines if s < threshold)

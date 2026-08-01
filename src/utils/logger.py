@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +34,7 @@ def _ensure_session() -> None:
     global _session_id, _log_file_path, _log_fh
     if _log_fh is not None:
         return
-    _session_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    _session_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     _LOGS_DIR.mkdir(parents=True, exist_ok=True)
     _log_file_path = _LOGS_DIR / f"{_session_id}.jsonl"
     _log_fh = open(_log_file_path, "a", buffering=1)  # line-buffered
@@ -58,13 +58,16 @@ class Logger:
     # Convenience methods matching the plan's per-stage events
 
     def vad_segment_closed(self, duration_s: float, sample_count: int) -> None:
-        _write("vad", "segment_closed", {"duration_s": duration_s, "sample_count": sample_count})
+        _write("vad", "segment_closed", {
+               "duration_s": duration_s, "sample_count": sample_count})
 
     def encoder_embed_complete(self, latency_ms: float, segment_duration_s: float) -> None:
-        _write("encoder", "embed_complete", {"latency_ms": latency_ms, "segment_duration_s": segment_duration_s})
+        _write("encoder", "embed_complete",
+               {"latency_ms": latency_ms, "segment_duration_s": segment_duration_s})
 
     def encoder_segment_too_short(self, segment_duration_s: float) -> None:
-        _write("encoder", "segment_too_short", {"segment_duration_s": segment_duration_s})
+        _write("encoder", "segment_too_short", {
+               "segment_duration_s": segment_duration_s})
 
     def tracker_speaker_assigned(
         self, speaker_id: str, best_sim: float, gallery_size: int, is_new: bool
@@ -72,11 +75,13 @@ class Logger:
         _write(
             "tracker",
             "speaker_assigned",
-            {"speaker_id": speaker_id, "best_sim": best_sim, "gallery_size": gallery_size, "is_new": is_new},
+            {"speaker_id": speaker_id, "best_sim": best_sim,
+             "gallery_size": gallery_size, "is_new": is_new},
         )
 
     def enrollment_match_result(self, matched_name: str | None, best_sim: float) -> None:
-        _write("enrollment", "match_result", {"matched_name": matched_name, "best_sim": best_sim})
+        _write("enrollment", "match_result", {
+               "matched_name": matched_name, "best_sim": best_sim})
 
     def policy_decision(
         self, speaker_id: str, matched_name: str | None, decision: str, mode: str
@@ -84,27 +89,30 @@ class Logger:
         _write(
             "policy",
             "decision",
-            {"speaker_id": speaker_id, "matched_name": matched_name, "decision": decision, "mode": mode},
+            {"speaker_id": speaker_id, "matched_name": matched_name,
+             "decision": decision, "mode": mode},
         )
 
+    def segment_dropped(self, reason: str, duration_s: float, sample_count: int) -> None:
+        """A closed speech segment that never reached the encoder.
+
+        Always written, never gated on debug: a latency report that omits
+        dropped work reads as flattering rather than accurate.
+        """
+        _write("main", "segment_dropped",
+               {"reason": reason, "duration_s": duration_s, "sample_count": sample_count})
+
     def ultravox_segment_sent(self, pcm_bytes: int, queue_depth: int) -> None:
-        _write("ultravox", "segment_sent", {"pcm_bytes": pcm_bytes, "queue_depth": queue_depth})
+        _write("ultravox", "segment_sent", {
+               "pcm_bytes": pcm_bytes, "queue_depth": queue_depth})
 
     def latency_record(self, timing: dict[str, float]) -> None:
         _write("pipeline", "latency_record", timing)
-
-    def enrollment_quality(self, username: str, norm: float, entropy: float, quality_pass: bool) -> None:
-        _write("enrollment", "quality_check", {"username": username, "norm": norm, "entropy": entropy, "quality_pass": quality_pass})
 
 
 def get_logger() -> Logger:
     """Return the module-level Logger singleton."""
     return _logger
-
-
-def get_session_id() -> str:
-    _ensure_session()
-    return _session_id
 
 
 def get_log_path() -> Path | None:

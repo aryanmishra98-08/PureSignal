@@ -6,13 +6,14 @@
 # Run with: pytest tests/test_audio_pipeline.py -v
 # =============================================================================
 import numpy as np
-import pytest
-import config
 
+import config
+from audio import features, resampler
 
 # ---------------------------------------------------------------------------
 # audio/vad.py tests
 # ---------------------------------------------------------------------------
+
 
 def _reset_vad():
     """Import vad fresh each test to reset module-level state."""
@@ -126,8 +127,6 @@ def test_vad_flush_returns_none_when_silent():
 # audio/features.py tests
 # ---------------------------------------------------------------------------
 
-from audio import features
-
 
 def test_features_normalize_peak():
     signal = np.array([0.0, 0.25, 0.5, -0.5, 0.1], dtype=np.float32)
@@ -148,8 +147,6 @@ def test_features_normalize_near_silent():
 # audio/resampler.py tests
 # ---------------------------------------------------------------------------
 
-from audio import resampler
-
 
 def test_resampler_output_length():
     one_second = np.zeros(config.SAMPLE_RATE, dtype=np.float32)
@@ -161,7 +158,8 @@ def test_resampler_output_length():
 
 def test_resampler_silence_frame():
     frame = resampler.silence_frame_48k()
-    expected_bytes = int(config.ULTRAVOX_IN_RATE * config.ULTRAVOX_CHUNK_MS / 1000) * 2
+    expected_bytes = int(config.ULTRAVOX_IN_RATE *
+                         config.ULTRAVOX_CHUNK_MS / 1000) * 2
     assert isinstance(frame, bytes)
     assert len(frame) == expected_bytes
     assert all(b == 0 for b in frame)

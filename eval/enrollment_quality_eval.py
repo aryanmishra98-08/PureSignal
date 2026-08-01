@@ -23,41 +23,19 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
+
 _PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
-import numpy as np
-
-
-def _load_wav(path: Path) -> np.ndarray:
-    from scipy.io import wavfile
-    from scipy.signal import resample_poly
-    from math import gcd
-    import config
-
-    rate, data = wavfile.read(path)
-    if data.dtype == np.int16:
-        audio = data.astype(np.float32) / 32768.0
-    elif data.dtype == np.int32:
-        audio = data.astype(np.float32) / 2147483648.0
-    elif data.dtype == np.float64:
-        audio = data.astype(np.float32)
-    else:
-        audio = data.astype(np.float32)
-    if audio.ndim == 2:
-        audio = audio.mean(axis=1)
-    target = config.SAMPLE_RATE
-    if rate != target:
-        g = gcd(rate, target)
-        audio = resample_poly(audio, target // g, rate // g).astype(np.float32)
-    return audio
+from audio.wav_io import load_wav  # noqa: E402 — needs sys.path above
 
 
 def _embed_wav(path: Path) -> np.ndarray | None:
     from audio.features import normalize
     from speaker.encoder import embed
-    audio = _load_wav(path)
+    audio = load_wav(path)
     return embed(normalize(audio))
 
 
@@ -69,7 +47,7 @@ def _enroll_with_n_samples(
 ) -> bool:
     """Average the first n embeddings and save as username.npy. Returns False if none succeed."""
     import config
-    from speaker.enrollment import validate_enrollment_quality, save_with_metadata
+    from speaker.enrollment import save_with_metadata, validate_enrollment_quality
 
     selected = wavs[:n]
     embeddings = []
@@ -87,14 +65,17 @@ def _enroll_with_n_samples(
         profile /= norm
 
     quality = validate_enrollment_quality(profile)
-    save_with_metadata(profile, username, profiles_dir, num_samples=len(embeddings), quality=quality)
+    save_with_metadata(profile, username, profiles_dir,
+                       num_samples=len(embeddings), quality=quality)
     return True
 
 
-def _run_eval(enrolled_dir: Path, test_dir: Path, imposters_dir: Path, enrolled_names: list[str]) -> float:
+def _run_eval(enrolled_dir: Path, test_dir: Path, imposters_dir: Path,
+              enrolled_names: list[str]) -> float:
     """Run speaker evaluation and return EER."""
-    from speaker.enrollment import load_profiles, match_with_score
     from metrics import compute_eer
+
+    from speaker.enrollment import load_profiles, match_with_score
 
     load_profiles(enrolled_names)
 
@@ -113,7 +94,8 @@ def _run_eval(enrolled_dir: Path, test_dir: Path, imposters_dir: Path, enrolled_
                     continue
                 _, best_sim = match_with_score(emb)
                 scores.append(best_sim)
-                labels.append(1 if is_genuine and speaker_dir.name in enrolled_names else 0)
+                labels.append(
+                    1 if is_genuine and speaker_dir.name in enrolled_names else 0)
 
     _collect(test_dir, is_genuine=True)
     _collect(imposters_dir, is_genuine=False)
@@ -126,15 +108,22 @@ def _run_eval(enrolled_dir: Path, test_dir: Path, imposters_dir: Path, enrolled_
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="EER vs enrollment samples curve")
-    parser.add_argument("--speaker-wavs", required=True, help="Directory with ≥5 WAVs for the target speaker")
-    parser.add_argument("--enrolled-dir", required=True, help="profiles/ directory (will be written to)")
-    parser.add_argument("--test-dir", required=True, help="test_audio/ directory")
-    parser.add_argument("--imposters-dir", required=True, help="imposters/ directory")
-    parser.add_argument("--username", required=True, help="Username of the target speaker")
+    parser = argparse.ArgumentParser(
+        description="EER vs enrollment samples curve")
+    parser.add_argument("--speaker-wavs", required=True,
+                        help="Directory with ≥5 WAVs for the target speaker")
+    parser.add_argument("--enrolled-dir", required=True,
+                        help="profiles/ directory (will be written to)")
+    parser.add_argument("--test-dir", required=True,
+                        help="test_audio/ directory")
+    parser.add_argument("--imposters-dir", required=True,
+                        help="imposters/ directory")
+    parser.add_argument("--username", required=True,
+                        help="Username of the target speaker")
     parser.add_argument("--sample-counts", nargs="+", type=int, default=[1, 2, 3, 5],
                         help="Number of samples to test (default: 1 2 3 5)")
-    parser.add_argument("--out", default="eval/results/quality_vs_samples", help="Output directory")
+    parser.add_argument(
+        "--out", default="eval/results/quality_vs_samples", help="Output directory")
     args = parser.parse_args()
 
     speaker_wavs_dir = Path(args.speaker_wavs)
@@ -146,7 +135,8 @@ def main() -> None:
 
     wavs = sorted(speaker_wavs_dir.glob("*.wav"))
     if not wavs:
-        print(f"[enrollment_quality_eval] ERROR: no WAVs in {speaker_wavs_dir}")
+        print(
+            f"[enrollment_quality_eval] ERROR: no WAVs in {speaker_wavs_dir}")
         sys.exit(1)
 
     max_n = max(args.sample_counts)
@@ -161,13 +151,16 @@ def main() -> None:
     load_encoder()
 
     # Also load any other enrolled profiles (to not change FAR baseline)
-    other_names = [p.stem for p in sorted(enrolled_dir.glob("*.npy")) if p.stem != args.username]
+    other_names = [p.stem for p in sorted(
+        enrolled_dir.glob("*.npy")) if p.stem != args.username]
 
     results = []
     for n in sorted(args.sample_counts):
         actual_n = min(n, len(wavs))
-        print(f"\n[enrollment_quality_eval] enrolling '{args.username}' with {actual_n} sample(s)...")
-        ok = _enroll_with_n_samples(args.username, wavs, actual_n, enrolled_dir)
+        print(f"\n[enrollment_quality_eval] enrolling '{args.username}' "
+              f"with {actual_n} sample(s)...")
+        ok = _enroll_with_n_samples(
+            args.username, wavs, actual_n, enrolled_dir)
         if not ok:
             print(f"  Skipped (no valid embeddings for n={actual_n})")
             continue
