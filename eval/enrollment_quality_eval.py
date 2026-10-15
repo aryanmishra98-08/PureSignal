@@ -1,19 +1,18 @@
-"""
-eval/enrollment_quality_eval.py — EER vs. number of enrollment samples curve.
+"""EER vs. number of enrollment samples.
 
-Enrolls the same speaker with 1, 2, 3, 5 samples and runs the speaker evaluator
-for each, then plots EER on y vs. num_samples on x.
+Re-enrolls the same speaker from 1, 2, 3, 5 samples and measures EER for each,
+then plots EER against the sample count.
 
-Requires the same test/impostor directory layout as run_speaker_eval.py.
+Expects the same test/impostor directory layout as run_speaker_eval.py.
 
 Usage:
     python eval/enrollment_quality_eval.py \\
-        --speaker-wavs eval/enrollment_wavs/alice  \\   # ≥5 WAVs for alice
-        --enrolled-dir profiles         \\
-        --test-dir     eval/test_audio             \\
-        --imposters-dir eval/imposters             \\
-        --username     alice                       \\
-        --out          eval/results/quality_vs_samples
+        --speaker-wavs  eval/enrollment_wavs/alice \\
+        --enrolled-dir  profiles \\
+        --test-dir      eval/test_audio \\
+        --imposters-dir eval/imposters \\
+        --username      alice \\
+        --out           eval/results/quality_vs_samples
 """
 
 from __future__ import annotations
@@ -25,37 +24,56 @@ from pathlib import Path
 
 import numpy as np
 
-_PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(_PROJECT_ROOT))
-sys.path.insert(0, str(_PROJECT_ROOT / "src"))
+from common import collect_wavs, embed_wav, get_pyplot, load_encoder
+from metrics import compute_eer
 
-from audio.wav_io import load_wav  # noqa: E402 — needs sys.path above
+_TAG = "enrollment_quality_eval"
 
 
-def _embed_wav(path: Path) -> np.ndarray | None:
-    from audio.features import normalize
-    from speaker.encoder import embed
-    audio = load_wav(path)
-    return embed(normalize(audio))
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="EER vs enrollment samples curve")
+    parser.add_argument(
+        "--speaker-wavs",
+        required=True,
+        help="Directory with the target speaker's enrollment WAVs",
+    )
+    parser.add_argument(
+        "--enrolled-dir", required=True, help="profiles/ directory (written to)"
+    )
+    parser.add_argument("--test-dir", required=True, help="test_audio/ directory")
+    parser.add_argument(
+        "--imposters-dir", required=True, help="imposters/ directory"
+    )
+    parser.add_argument(
+        "--username", required=True, help="Username of the target speaker"
+    )
+    parser.add_argument(
+        "--sample-counts",
+        nargs="+",
+        type=int,
+        default=[1, 2, 3, 5],
+        help="Numbers of samples to test (default: 1 2 3 5)",
+    )
+    parser.add_argument(
+        "--out", default="eval/results/quality_vs_samples", help="Output directory"
+    )
+    return parser.parse_args()
 
 
 def _enroll_with_n_samples(
-    username: str,
-    wavs: list[Path],
-    n: int,
-    profiles_dir: Path,
+    encoder, username: str, wavs: list[Path], n: int, profiles_dir: Path
 ) -> bool:
-    """Average the first n embeddings and save as username.npy. Returns False if none succeed."""
+    """Average the first ``n`` embeddings into a profile and save it.
+
+    Returns:
+        False if none of the selected WAVs could be embedded.
+    """
     import config
     from speaker.enrollment import save_with_metadata, validate_enrollment_quality
 
-    selected = wavs[:n]
-    embeddings = []
-    for wav_path in selected:
-        emb = _embed_wav(wav_path)
-        if emb is not None:
-            embeddings.append(emb)
-
+    embeddings = [
+        e for e in (embed_wav(encoder, p) for p in wavs[:n]) if e is not None
+    ]
     if not embeddings:
         return False
 
@@ -64,41 +82,43 @@ def _enroll_with_n_samples(
     if norm > config.NORM_FLOOR:
         profile /= norm
 
-    quality = validate_enrollment_quality(profile)
-    save_with_metadata(profile, username, profiles_dir,
-                       num_samples=len(embeddings), quality=quality)
+    save_with_metadata(
+        profile,
+        username,
+        profiles_dir,
+        num_samples=len(embeddings),
+        quality=validate_enrollment_quality(profile),
+    )
     return True
 
 
-def _run_eval(enrolled_dir: Path, test_dir: Path, imposters_dir: Path,
-              enrolled_names: list[str]) -> float:
-    """Run speaker evaluation and return EER."""
-    from metrics import compute_eer
+def _measure_eer(
+    encoder,
+    test_dir: Path,
+    imposters_dir: Path,
+    enrolled_names: list[str],
+    profiles_dir: Path,
+) -> float:
+    """Load the named profiles and return EER over the test and impostor sets."""
+    from speaker.enrollment import EnrollmentStore
 
-    from speaker.enrollment import load_profiles, match_with_score
-
-    load_profiles(enrolled_names)
+    store = EnrollmentStore.load(enrolled_names, profiles_dir=profiles_dir)
+    genuine = set(enrolled_names)
 
     scores: list[float] = []
     labels: list[int] = []
 
-    def _collect(directory: Path, is_genuine: bool) -> None:
-        if not directory.exists():
-            return
-        for speaker_dir in sorted(directory.iterdir()):
-            if not speaker_dir.is_dir():
-                continue
-            for wav_path in sorted(speaker_dir.glob("*.wav")):
-                emb = _embed_wav(wav_path)
-                if emb is None:
+    for directory, is_genuine_set in ((test_dir, True), (imposters_dir, False)):
+        for speaker_name, wavs in collect_wavs(directory).items():
+            for wav_path in wavs:
+                embedding = embed_wav(encoder, wav_path)
+                if embedding is None:
                     continue
-                _, best_sim = match_with_score(emb)
+                _, best_sim = store.match_with_score(embedding)
                 scores.append(best_sim)
                 labels.append(
-                    1 if is_genuine and speaker_dir.name in enrolled_names else 0)
-
-    _collect(test_dir, is_genuine=True)
-    _collect(imposters_dir, is_genuine=False)
+                    1 if is_genuine_set and speaker_name in genuine else 0
+                )
 
     if not scores:
         return float("nan")
@@ -107,93 +127,83 @@ def _run_eval(enrolled_dir: Path, test_dir: Path, imposters_dir: Path,
     return eer_val
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="EER vs enrollment samples curve")
-    parser.add_argument("--speaker-wavs", required=True,
-                        help="Directory with ≥5 WAVs for the target speaker")
-    parser.add_argument("--enrolled-dir", required=True,
-                        help="profiles/ directory (will be written to)")
-    parser.add_argument("--test-dir", required=True,
-                        help="test_audio/ directory")
-    parser.add_argument("--imposters-dir", required=True,
-                        help="imposters/ directory")
-    parser.add_argument("--username", required=True,
-                        help="Username of the target speaker")
-    parser.add_argument("--sample-counts", nargs="+", type=int, default=[1, 2, 3, 5],
-                        help="Number of samples to test (default: 1 2 3 5)")
-    parser.add_argument(
-        "--out", default="eval/results/quality_vs_samples", help="Output directory")
-    args = parser.parse_args()
+def _plot_curve(results: list[dict], username: str, out_path: Path) -> None:
+    plt = get_pyplot(_TAG)
+    if plt is None:
+        return
 
-    speaker_wavs_dir = Path(args.speaker_wavs)
+    xs = [r["num_samples"] for r in results]
+    ys = [r["eer"] * 100 for r in results]
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(xs, ys, "o-", color="steelblue", linewidth=2, markersize=8)
+    ax.set_xlabel("Number of enrollment samples")
+    ax.set_ylabel("EER (%)")
+    ax.set_title(f"Enrollment quality vs. accuracy — {username}")
+    ax.set_xticks(xs)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    print(f"[{_TAG}] plot -> {out_path}")
+
+
+def main() -> None:
+    args = _parse_args()
+
     enrolled_dir = Path(args.enrolled_dir)
     test_dir = Path(args.test_dir)
     imposters_dir = Path(args.imposters_dir)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    wavs = sorted(speaker_wavs_dir.glob("*.wav"))
+    wavs = sorted(Path(args.speaker_wavs).glob("*.wav"))
     if not wavs:
-        print(
-            f"[enrollment_quality_eval] ERROR: no WAVs in {speaker_wavs_dir}")
+        print(f"[{_TAG}] ERROR: no WAVs in {args.speaker_wavs}")
         sys.exit(1)
 
     max_n = max(args.sample_counts)
     if len(wavs) < max_n:
         print(
-            f"[enrollment_quality_eval] WARNING: only {len(wavs)} WAVs available; "
+            f"[{_TAG}] WARNING: only {len(wavs)} WAVs available; "
             f"max sample count {max_n} will use all available."
         )
 
-    print("[enrollment_quality_eval] loading encoder...")
-    from speaker.encoder import load_encoder
-    load_encoder()
+    print(f"[{_TAG}] loading encoder...")
+    encoder = load_encoder()
 
-    # Also load any other enrolled profiles (to not change FAR baseline)
-    other_names = [p.stem for p in sorted(
-        enrolled_dir.glob("*.npy")) if p.stem != args.username]
+    # Keep the other enrolled profiles loaded so the FAR baseline is unchanged.
+    other_names = [
+        p.stem for p in sorted(enrolled_dir.glob("*.npy")) if p.stem != args.username
+    ]
 
-    results = []
+    results: list[dict] = []
     for n in sorted(args.sample_counts):
         actual_n = min(n, len(wavs))
-        print(f"\n[enrollment_quality_eval] enrolling '{args.username}' "
-              f"with {actual_n} sample(s)...")
-        ok = _enroll_with_n_samples(
-            args.username, wavs, actual_n, enrolled_dir)
-        if not ok:
+        print(f"\n[{_TAG}] enrolling '{args.username}' with {actual_n} sample(s)...")
+
+        if not _enroll_with_n_samples(
+            encoder, args.username, wavs, actual_n, enrolled_dir
+        ):
             print(f"  Skipped (no valid embeddings for n={actual_n})")
             continue
 
-        enrolled_names = other_names + [args.username]
-        eer = _run_eval(enrolled_dir, test_dir, imposters_dir, enrolled_names)
-        print(f"  n={actual_n}: EER={eer*100:.2f}%")
+        eer = _measure_eer(
+            encoder,
+            test_dir,
+            imposters_dir,
+            [*other_names, args.username],
+            enrolled_dir,
+        )
+        print(f"  n={actual_n}: EER={eer * 100:.2f}%")
         results.append({"num_samples": actual_n, "eer": eer})
 
     out_json = out_dir / "quality_vs_samples.json"
-    with open(out_json, "w") as f:
+    with open(out_json, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
-    print(f"\n[enrollment_quality_eval] results → {out_json}")
+    print(f"\n[{_TAG}] results -> {out_json}")
 
-    try:
-        import matplotlib.pyplot as plt
-
-        xs = [r["num_samples"] for r in results]
-        ys = [r["eer"] * 100 for r in results]
-
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(xs, ys, "o-", color="steelblue", linewidth=2, markersize=8)
-        ax.set_xlabel("Number of enrollment samples")
-        ax.set_ylabel("EER (%)")
-        ax.set_title(f"Enrollment quality vs. accuracy — {args.username}")
-        ax.set_xticks(xs)
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        plot_path = out_dir / "eer_vs_samples.png"
-        fig.savefig(plot_path, dpi=150)
-        print(f"[enrollment_quality_eval] plot → {plot_path}")
-    except ImportError:
-        print("[enrollment_quality_eval] matplotlib not installed — skipping plot")
+    if results:
+        _plot_curve(results, args.username, out_dir / "eer_vs_samples.png")
 
 
 if __name__ == "__main__":

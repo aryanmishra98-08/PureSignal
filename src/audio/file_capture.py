@@ -1,16 +1,17 @@
+"""WAV-file audio source that mirrors the microphone source's interface.
+
+Pushes 20ms float32 frames into a frame queue at real-time cadence so the rest
+of the pipeline (VAD -> encoder -> tracker -> policy) runs unmodified.
+
+Any WAV is accepted: channel count and sample rate are converted on load.
+
+Usage (from main.py --source <path>):
+    source = AudioFileCapture(Path("recording.wav"), frame_queue)
+    source.start()
+    ...
+    source.stop()
 """
-audio/file_capture.py — WAV-file audio source, drop-in replacement for the mic.
 
-Reads a WAV file from disk and feeds it into the same queues that
-audio/capture.py normally fills from the microphone, so the rest of the
-pipeline (VAD, encoder, etc.) is unaware of the source difference.
-
-Routing is delegated to the shared WindowedSource owned by audio/capture.py, so
-mic mode and file mode go through byte-identical windowing and enqueue logic.
-
-Audio is replayed in real-time (time.sleep per frame) to mimic live capture.
-A None sentinel is pushed after the last frame to signal end-of-stream.
-"""
 from __future__ import annotations
 
 import queue
@@ -22,84 +23,76 @@ import numpy as np
 
 import config
 from audio.wav_io import load_wav
+from utils.logger import get_logger
+
+_log = get_logger()
+
+# How long stop() waits for the streaming thread to finish, in seconds.
+_JOIN_TIMEOUT_S = 2.0
+
+# How long the end-of-stream sentinel waits for a slot in the queue, in seconds.
+_SENTINEL_TIMEOUT_S = 5.0
 
 
 class AudioFileCapture:
-    """
-    Daemon thread that streams a WAV file into the pipeline queues.
+    """Streams a WAV file into ``frame_queue`` at real-time 20ms cadence.
 
-    Usage:
-        source = AudioFileCapture(Path("speech.wav"), capture.frame_queue)
-        thread = source.start()
-        # ... pipeline runs ...
-        source.stop()
-        thread.join()
+    When the file is exhausted, pushes ``None`` as a sentinel so the consumer
+    knows the source has ended.
     """
 
-    def __init__(self, wav_path: Path, frame_queue: queue.Queue,
-                 realtime: bool = True) -> None:
-        """
-        Args:
-            wav_path:    Path to the source WAV file.
-            frame_queue: capture.frame_queue — retained for API compatibility;
-                         actual routing goes through capture's WindowedSource.
-            realtime:    Sleep between frames to mimic live capture.  Tests set
-                         this False to replay a file as fast as possible.
-        """
+    def __init__(self, wav_path: Path | str, frame_queue: queue.Queue) -> None:
         self._path = Path(wav_path)
-        self._frame_queue = frame_queue
-        self._realtime = realtime
+        self._queue = frame_queue
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
-    def start(self) -> threading.Thread:
-        """
-        Load the WAV file and begin streaming on a daemon thread.
-
-        Returns:
-            The started threading.Thread — join it after stop() to wait for EOF.
-        """
+    def start(self) -> None:
+        """Load the WAV and begin streaming frames on a background thread."""
         audio = load_wav(self._path)
-        self._thread = threading.Thread(target=self._run, args=(audio,),
-                                        daemon=True, name="file-capture")
-        self._thread.start()
-        print(
-            f"[file_capture] streaming '{self._path.name}' — "
-            f"{len(audio)/config.SAMPLE_RATE:.1f}s, "
-            f"extractor={'enabled' if config.EXTRACTOR_ENABLED else 'disabled'}"
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(audio,),
+            daemon=True,
+            name="file-capture",
         )
-        return self._thread
+        self._thread.start()
+        _log.info(
+            "file_capture",
+            f"streaming '{self._path.name}' — "
+            f"{len(audio) / config.SAMPLE_RATE:.1f}s @ {config.SAMPLE_RATE}Hz",
+        )
 
     def stop(self) -> None:
-        """Signal the streaming thread to stop after the current frame."""
+        """Signal the streaming thread to stop and wait briefly for it to exit."""
         self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=_JOIN_TIMEOUT_S)
+            self._thread = None
 
     def _run(self, audio: np.ndarray) -> None:
-        """
-        Main streaming loop — runs on a daemon thread.
-
-        Slices `audio` into FRAME_SAMPLES chunks and pushes each through the
-        shared WindowedSource, sleeping FRAME_MS ms between chunks to simulate
-        real-time capture.  On natural EOF or stop(), closes the source, which
-        flushes buffered audio and pushes the None sentinel.
-        """
-        from audio import capture as _capture
-        source = _capture.get_source()
         frame_size = config.FRAME_SAMPLES
-        frame_dur = config.FRAME_MS / 1000.0  # seconds per frame
-        offset = 0
+        frame_duration_s = config.FRAME_MS / 1000.0
 
-        while not self._stop_event.is_set():
-            chunk = audio[offset: offset + frame_size]
-            if len(chunk) == 0:
-                break  # natural EOF
-            if len(chunk) < frame_size:
-                # Zero-pad the final partial frame
+        for offset in range(0, len(audio), frame_size):
+            if self._stop_event.is_set():
+                break
+
+            chunk = audio[offset : offset + frame_size]
+            if len(chunk) < frame_size:  # pad the final short frame
                 chunk = np.pad(chunk, (0, frame_size - len(chunk)))
-            source.push_frame(chunk)
-            offset += frame_size
-            if self._realtime:
-                time.sleep(frame_dur)  # real-time pacing
 
-        source.close()  # flush + EOF sentinel
-        print("[file_capture] stream ended")
+            try:
+                self._queue.put_nowait(chunk)
+            except queue.Full:
+                pass  # consumer is behind; drop the frame
+
+            time.sleep(frame_duration_s)  # real-time cadence
+
+        # Sentinel signals end-of-stream. Use a blocking put so it is never
+        # dropped, but cap the wait so a stalled consumer cannot hang shutdown.
+        try:
+            self._queue.put(None, timeout=_SENTINEL_TIMEOUT_S)
+        except queue.Full:
+            pass
+        _log.info("file_capture", "stream ended")

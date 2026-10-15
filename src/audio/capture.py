@@ -1,126 +1,75 @@
-# =============================================================================
-# audio/capture.py — Microphone capture with dual-output routing
-#
-# Provides two queues that downstream consumers read from:
-#
-#   frame_queue  (gatekeeper mode, extractor.enabled = false)
-#       Raw 20ms float32 frames pushed one at a time.
-#       Consumers: vad.process_frame() in _process_loop_gatekeeper.
-#
-#   window_queue  (extractor mode, extractor.enabled = true)
-#       Overlapping windows as (seq_no, window, new_samples) tuples, ready for
-#       parallel extraction workers.
-#       Consumers: _process_loop_extractor via ResequencingBuffer.
-#
-# Routing itself lives in audio/windowed_source.py so that the mic and the WAV
-# replay thread share one implementation.  Nothing here reads config at import
-# time — init() is called by the pipeline after any --set overrides are bound.
-# =============================================================================
+"""Microphone audio source.
+
+Mirrors AudioFileCapture's interface so main.py drives either source
+through the same start()/stop() calls.
+"""
+
+from __future__ import annotations
+
 import queue
 
 import numpy as np
+import sounddevice as sd
 
 import config
-from audio.windowed_source import WindowedSource
+from utils.logger import get_logger
 
-# sounddevice is imported lazily inside the mic entry points. It requires
-# PortAudio at import time, which file-mode and container runs do not have and
-# do not need.
+_log = get_logger()
 
-# Both queues are module-level so file_capture.py can share the same objects.
-frame_queue: queue.Queue = queue.Queue(
-    maxsize=500)   # gatekeeper mode — raw 20ms frames
-window_queue: queue.Queue = queue.Queue(
-    maxsize=100)  # extractor mode — window tuples
-
-_source: WindowedSource | None = None
+# Raw frame queue — the capture callback pushes here, the pipeline reads.
+# 500 frames is roughly 10s of 20ms audio.
+frame_queue: queue.Queue = queue.Queue(maxsize=500)
 
 
-def get_source() -> WindowedSource:
-    """
-    Return the routing layer, constructing it on first use.
+class MicCapture:
+    """Streams microphone input into ``frame_queue`` as 20ms float32 frames."""
 
-    Construction is deferred rather than done at import time: which queue is
-    used depends on config.EXTRACTOR_ENABLED, which must be read after any
-    --set overrides are applied.  Idempotent.
-    """
-    global _source
-    if _source is None:
-        _source = WindowedSource(window_queue, frame_queue)
-    return _source
+    def __init__(self, target_queue: queue.Queue | None = None) -> None:
+        self._queue = frame_queue if target_queue is None else target_queue
+        self._stream: sd.InputStream | None = None
 
+    def start(self) -> None:
+        """Open and start the microphone input stream.
 
-def _capture_callback(indata: np.ndarray, frames: int, time_info, status) -> None:
-    """
-    sounddevice callback — called on the audio thread for every captured block.
+        Raises:
+            RuntimeError: If the input device cannot be opened.
+        """
+        try:
+            self._stream = sd.InputStream(
+                samplerate=config.SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                blocksize=config.FRAME_SAMPLES,
+                callback=self._on_audio,
+            )
+            self._stream.start()
+        except sd.PortAudioError as e:
+            self._stream = None
+            raise RuntimeError(
+                f"Failed to open microphone: {e}\n"
+                "  Check that a microphone is connected and accessible."
+            ) from e
 
-    Hands the frame to WindowedSource, which routes it to the queue matching the
-    active pipeline mode.  Never blocks: full queues drop rather than stall the
-    audio thread, which would cause input underruns.  Drops are logged.
-    """
-    if status:
-        print(f"[capture] sounddevice status: {status}")
-    frame = indata[:, 0].copy()  # mono: take first channel
-    get_source().push_frame(frame)
-
-
-def flush_window_buffer() -> None:
-    """
-    Flush buffered audio at end-of-stream and push the None sentinel.
-
-    Called by the pipeline shutdown path so that mic mode gets the same clean
-    end-of-stream handling as file mode, instead of relying on the process
-    exiting out from under the consumer loop.
-    """
-    get_source().close()
-
-
-def start_capture():
-    """
-    Open and start the default microphone input stream.
-
-    Returns:
-        sd.InputStream — the active stream; pass to stop_capture() to close it.
-
-    Raises:
-        RuntimeError if PortAudio is unavailable or cannot open the microphone.
-    """
-    get_source()
-    try:
-        import sounddevice as sd
-    except OSError as e:
-        raise RuntimeError(
-            f"[capture] PortAudio is unavailable, so mic capture is not "
-            f"possible: {e}\n  Use --source path/to/file.wav instead."
-        ) from e
-    try:
-        stream = sd.InputStream(
-            samplerate=config.SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            blocksize=config.FRAME_SAMPLES,
-            callback=_capture_callback,
+        _log.info(
+            "capture",
+            f"mic open — {config.SAMPLE_RATE}Hz, {config.FRAME_MS}ms frames "
+            f"({config.FRAME_SAMPLES} samples)",
         )
-        stream.start()
-    except sd.PortAudioError as e:
-        raise RuntimeError(f"[capture] Failed to open microphone: {e}") from e
-    print(
-        f"[capture] mic open — {config.SAMPLE_RATE}Hz, {config.FRAME_MS}ms frames, "
-        f"extractor={'enabled' if config.EXTRACTOR_ENABLED else 'disabled'}"
-    )
-    return stream
 
+    def stop(self) -> None:
+        """Stop and close the microphone stream."""
+        if self._stream is None:
+            return
+        self._stream.stop()
+        self._stream.close()
+        self._stream = None
+        _log.info("capture", "mic closed")
 
-def stop_capture(stream) -> None:
-    """Stop and close the microphone stream opened by start_capture()."""
-    stream.stop()
-    stream.close()
-    print("[capture] mic closed")
-
-
-def reset() -> None:
-    """Drop the routing layer so the next session rebuilds it from live config."""
-    global _source
-    if _source is not None:
-        _source.reset()
-    _source = None
+    def _on_audio(self, indata: np.ndarray, frames: int, time_info, status) -> None:
+        """sounddevice callback — runs on the audio thread and must not block."""
+        if status:
+            _log.warning("capture", f"sounddevice status: {status}")
+        try:
+            self._queue.put_nowait(indata[:, 0].copy())  # mono float32
+        except queue.Full:
+            pass  # the pipeline is falling behind; drop the frame

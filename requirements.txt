@@ -11,6 +11,9 @@ sounddevice>=0.4.6
 # WebSocket client for Fixie.ai Ultravox
 websockets>=12.0
 
+# HTTP client for the Ultravox REST call-creation API
+requests>=2.31.0
+
 # Signal processing — resampling, WAV I/O
 scipy>=1.11.0
 
@@ -38,11 +41,3 @@ matplotlib>=3.8.0
 
 # VAD TextGrid label support (optional)
 textgrid>=1.5.0
-requests>=2.31.0
-
-# Target speaker separation (Conv-TasNet) — extractor mode only.
-# Optional: run gatekeeper mode with `--set extractor.enabled=false` and this is
-# never imported. Note asteroid pins an older torch range than the one above, so
-# installing it may downgrade torch; install it in a separate environment if that
-# matters. There is no SpeakerBeam in asteroid — see PHASE0_FINDINGS.md.
-asteroid>=0.6.0

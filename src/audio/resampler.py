@@ -1,43 +1,50 @@
-# =============================================================================
-# audio/resampler.py — 16kHz float32 → 48kHz int16 PCM bytes
-#                      Used immediately before WebSocket send
-# =============================================================================
+"""Conversion from pipeline audio to the PCM format Ultravox expects.
+
+16kHz float32 -> 48kHz int16, applied immediately before each WebSocket send.
+"""
+
+from __future__ import annotations
+
+from math import gcd
 
 import numpy as np
 from scipy.signal import resample_poly
 
 import config
 
-# Resample ratio: 48000 / 16000 = 3/1
-_UP = 3
-_DOWN = 1
+# int16 full scale, used to convert normalized floats to PCM.
+_INT16_PEAK = 32767
+
+# Resampling ratio derived from the configured rates (16k -> 48k gives 3/1).
+_GCD = gcd(config.SAMPLE_RATE, config.ULTRAVOX_IN_RATE)
+_UP = config.ULTRAVOX_IN_RATE // _GCD
+_DOWN = config.SAMPLE_RATE // _GCD
 
 
 def to_48k_pcm(segment: np.ndarray) -> bytes:
-    """
-    Resample a 16kHz float32 segment to 48kHz int16 PCM bytes.
+    """Resample a pipeline-rate float32 segment to Ultravox input PCM.
 
     Args:
-        segment: float32 ndarray at 16kHz
+        segment: float32 samples at ``config.SAMPLE_RATE``.
 
     Returns:
-        bytes — int16 little-endian PCM at 48kHz
+        Little-endian int16 PCM bytes at ``config.ULTRAVOX_IN_RATE``.
     """
-    resampled = resample_poly(segment, _UP, _DOWN).astype(np.float32)
-
-    # Clip to [-1, 1] before int16 conversion to avoid wraparound distortion
+    resampled = resample_poly(segment, _UP, _DOWN)
+    # Clip before the int16 cast; resampling overshoot would otherwise wrap.
     resampled = np.clip(resampled, -1.0, 1.0)
-
-    # Scale to int16 range
-    pcm_int16 = (resampled * 32767).astype(np.int16)
-    return pcm_int16.tobytes()
+    return (resampled * _INT16_PEAK).astype(np.int16).tobytes()
 
 
 def silence_frame_48k() -> bytes:
+    """Return one chunk of int16 silence at the Ultravox input rate.
+
+    Used to keep the outbound stream continuous between speech segments.
     """
-    Return one 20ms silence frame at 48kHz int16.
-    Used to pad between speech segments on the WebSocket stream.
-    960 samples = 20ms @ 48kHz.
-    """
+    return bytes(pcm_frame_bytes())
+
+
+def pcm_frame_bytes() -> int:
+    """Return the byte length of one Ultravox chunk of int16 PCM."""
     samples = int(config.ULTRAVOX_IN_RATE * config.ULTRAVOX_CHUNK_MS / 1000)
-    return bytes(samples * 2)  # int16 = 2 bytes per sample
+    return samples * 2  # int16 = 2 bytes per sample

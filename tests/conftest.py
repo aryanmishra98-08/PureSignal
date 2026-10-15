@@ -1,10 +1,14 @@
-# =============================================================================
-# tests/conftest.py — pytest session bootstrap
-#
-# Inserts src/ onto sys.path so that all test modules can import pipeline
-# packages (config, audio, speaker, utils) without a package install.
-# =============================================================================
-import os
-import sys
+"""Make src/ importable for the test suite.
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+pyproject.toml already sets ``pythonpath = ["src"]`` for pytest; this repeats
+it so the tests still import cleanly when pytest is invoked with a different
+config or rootdir.
+"""
+
+import sys
+from pathlib import Path
+
+_SRC = Path(__file__).parent.parent / "src"
+
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))

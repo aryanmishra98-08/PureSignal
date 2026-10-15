@@ -1,172 +1,169 @@
-# =============================================================================
-# audio/vad.py — Frame-level Voice Activity Detection
-#                Energy + Zero-Crossing Rate + adaptive noise floor + hangover
-#
-# Config is read at call time, never baked in at import, so that --set
-# overrides and eval sweeps actually take effect.
-# =============================================================================
+"""Frame-level Voice Activity Detection.
+
+Energy + zero-crossing rate against an adaptive noise floor, with a hangover
+window so brief pauses do not split an utterance.
+
+Tunables are captured when the detector is constructed, so a caller that
+overrides config (the evaluators, --set on the CLI) simply builds a detector
+afterwards. Each instance owns its state, so several can run side by side.
+"""
+
+from __future__ import annotations
 
 import numpy as np
 
 import config
-from utils.logger import get_logger
 
-_log = get_logger()
-
-# Internal state — module-level, reset via reset()
-_noise_floor = config.NOISE_FLOOR_INIT
-_hangover_frames_left = 0
-_speech_active = False
-_segment_buf: np.ndarray | None = None
-_segment_fill = 0
+# Hard cap on one segment. The buffer is allocated once and reused, and 30s is
+# far beyond any expected utterance.
+_MAX_SEGMENT_S = 30.0
 
 
-def _hangover_frames() -> int:
-    """Frames of tail silence tolerated before a segment closes."""
-    return int(config.HANGOVER_MS / config.FRAME_MS)
+class VoiceActivityDetector:
+    """Splits a stream of fixed-size frames into speech segments."""
 
+    def __init__(
+        self,
+        *,
+        sample_rate: int | None = None,
+        frame_ms: int | None = None,
+        energy_multiplier: float | None = None,
+        zcr_threshold: float | None = None,
+        hangover_ms: int | None = None,
+        noise_floor_init: float | None = None,
+        noise_floor_ema_fast: float | None = None,
+        noise_floor_ema_slow: float | None = None,
+        max_segment_s: float = _MAX_SEGMENT_S,
+    ) -> None:
+        """Build a detector. Any argument left as None is read from config."""
+        self.sample_rate = config.SAMPLE_RATE if sample_rate is None else sample_rate
+        self.frame_ms = config.FRAME_MS if frame_ms is None else frame_ms
+        self.energy_multiplier = (
+            config.ENERGY_MULTIPLIER if energy_multiplier is None else energy_multiplier
+        )
+        self.zcr_threshold = (
+            config.ZCR_THRESHOLD if zcr_threshold is None else zcr_threshold
+        )
+        self.hangover_ms = config.HANGOVER_MS if hangover_ms is None else hangover_ms
+        self.noise_floor_init = (
+            config.NOISE_FLOOR_INIT if noise_floor_init is None else noise_floor_init
+        )
+        self._ema_fast = (
+            config.NOISE_FLOOR_EMA_FAST
+            if noise_floor_ema_fast is None
+            else noise_floor_ema_fast
+        )
+        self._ema_slow = (
+            config.NOISE_FLOOR_EMA_SLOW
+            if noise_floor_ema_slow is None
+            else noise_floor_ema_slow
+        )
 
-def _max_segment_samples() -> int:
-    """Hard cap on segment length; the segment force-closes here."""
-    return int(config.MAX_SEGMENT_S * config.SAMPLE_RATE)
+        self._hangover_frames = int(self.hangover_ms / self.frame_ms)
+        self._max_samples = int(max_segment_s * self.sample_rate)
+        self._buffer = np.empty(self._max_samples, dtype=np.float32)
 
+        self._noise_floor = self.noise_floor_init
+        self._hangover_left = 0
+        self._speech_active = False
+        self._fill = 0
 
-def _min_noise_floor() -> float:
-    """
-    Lower bound on the adaptive noise floor.
+    # -- internals -------------------------------------------------------
 
-    Without this the EMA converges toward zero on digitally-silent input, and
-    the speech threshold (floor × multiplier) converges with it, turning the
-    VAD into a hair trigger that fires on inaudible noise.
-    """
-    return config.NOISE_FLOOR_INIT * config.NOISE_FLOOR_MIN_RATIO
+    @staticmethod
+    def _rms(frame: np.ndarray) -> float:
+        return float(np.sqrt(np.mean(frame**2)))
 
+    @staticmethod
+    def _zcr(frame: np.ndarray) -> float:
+        crossings = np.sum(np.abs(np.diff(np.sign(frame)))) / 2
+        return float(crossings / len(frame))
 
-def _ensure_buf() -> np.ndarray:
-    """Allocate the segment buffer lazily so MAX_SEGMENT_S stays overridable."""
-    global _segment_buf
-    needed = _max_segment_samples()
-    if _segment_buf is None or len(_segment_buf) != needed:
-        _segment_buf = np.empty(needed, dtype=np.float32)
-    return _segment_buf
+    def _update_noise_floor(self, rms: float) -> None:
+        """Adapt the noise floor toward the level observed during silence."""
+        self._noise_floor = self._ema_slow * self._noise_floor + self._ema_fast * rms
 
+    def _append(self, frame: np.ndarray) -> None:
+        """Add a frame to the open segment, discarding overflow past the cap."""
+        end = self._fill + len(frame)
+        if end <= self._max_samples:
+            self._buffer[self._fill : end] = frame
+            self._fill = end
 
-def _rms(frame: np.ndarray) -> float:
-    """Return the root-mean-square energy of a single frame."""
-    return float(np.sqrt(np.mean(frame**2)))
+    def _close_segment(self) -> np.ndarray:
+        """Detach the buffered segment and clear speech state."""
+        segment = self._buffer[: self._fill].copy()
+        self._speech_active = False
+        self._fill = 0
+        return segment
 
+    # -- public API ------------------------------------------------------
 
-def _zcr(frame: np.ndarray) -> float:
-    """Return the zero-crossing rate of a frame (crossings per sample).
+    def process_frame(self, frame: np.ndarray) -> np.ndarray | None:
+        """Feed one frame to the detector.
 
-    High ZCR is characteristic of noise or unvoiced fricatives;
-    low ZCR combined with high energy signals voiced speech.
-    """
-    signs = np.sign(frame)
-    crossings = np.sum(np.abs(np.diff(signs))) / 2
-    return float(crossings / len(frame))
+        Args:
+            frame: One frame of float32 audio, ``frame_samples`` long.
 
+        Returns:
+            The completed speech segment when one closes, otherwise None. A
+            segment closes once speech has been seen, energy drops below the
+            threshold, and the hangover counter expires.
+        """
+        rms = self._rms(frame)
+        is_speech = (
+            rms > self._noise_floor * self.energy_multiplier
+            and self._zcr(frame) < self.zcr_threshold
+        )
 
-def _update_noise_floor(rms: float) -> None:
-    """Slowly adapt noise floor upward/downward during silence, clamped below."""
-    global _noise_floor
-    updated = (
-        config.NOISE_FLOOR_EMA_SLOW * _noise_floor + config.NOISE_FLOOR_EMA_FAST * rms
-    )
-    _noise_floor = max(updated, _min_noise_floor())
+        if is_speech:
+            self._speech_active = True
+            self._hangover_left = self._hangover_frames
+            self._append(frame)
+            return None
 
+        if not self._speech_active:
+            self._update_noise_floor(rms)  # pure silence
+            return None
 
-def _append(frame: np.ndarray) -> np.ndarray | None:
-    """
-    Append a frame to the open segment.
+        if self._hangover_left > 0:
+            # Still inside the hangover window — keep the frame.
+            self._hangover_left -= 1
+            self._append(frame)
+            return None
 
-    Returns a completed segment if the length cap was reached, in which case the
-    segment is force-closed and a new one is started with `frame`.  Returns None
-    in the normal case.
-    """
-    global _segment_fill
-    buf = _ensure_buf()
-    cap = len(buf)
-    end = _segment_fill + len(frame)
-    if end <= cap:
-        buf[_segment_fill:end] = frame
-        _segment_fill = end
+        # Hangover expired — close the segment.
+        if self._fill == 0:
+            self._speech_active = False
+            return None
+
+        segment = self._close_segment()
+        self._update_noise_floor(rms)
+        return segment
+
+    def flush(self) -> np.ndarray | None:
+        """Return any segment still open, for example when the source hits EOF.
+
+        Returns:
+            The buffered segment, or None if no speech is currently open.
+        """
+        if self._speech_active and self._fill > 0:
+            return self._close_segment()
         return None
 
-    # Cap reached — close what we have rather than silently discarding audio.
-    _log("vad", "segment_cap_reached", sample_count=int(_segment_fill),
-         max_segment_s=config.MAX_SEGMENT_S)
-    segment = buf[:_segment_fill].copy()
-    n = min(len(frame), cap)
-    buf[0:n] = frame[:n]
-    _segment_fill = n
-    return segment
+    def reset(self) -> None:
+        """Clear all state, keeping the tunables this detector was built with."""
+        self._noise_floor = self.noise_floor_init
+        self._hangover_left = 0
+        self._speech_active = False
+        self._fill = 0
 
+    @property
+    def frame_samples(self) -> int:
+        """Number of samples in one frame at this detector's settings."""
+        return int(self.sample_rate * self.frame_ms / 1000)
 
-def process_frame(frame: np.ndarray) -> np.ndarray | None:
-    """
-    Feed one 20ms frame. Returns a complete speech segment (np.ndarray)
-    when a segment closes, otherwise returns None.
-
-    A segment closes when:
-      - We were in speech, energy drops below threshold, and hangover expires
-      - Or the segment reaches MAX_SEGMENT_S and is force-closed
-    """
-    global _noise_floor, _hangover_frames_left, _speech_active, _segment_fill
-
-    rms = _rms(frame)
-    zcr = _zcr(frame)
-
-    is_speech_frame = (
-        rms > _noise_floor * config.ENERGY_MULTIPLIER and zcr < config.ZCR_THRESHOLD
-    )
-
-    if is_speech_frame:
-        _speech_active = True
-        _hangover_frames_left = _hangover_frames()
-        return _append(frame)
-
-    # Not a speech frame
-    if _speech_active:
-        if _hangover_frames_left > 0:
-            # Within hangover window — still part of segment
-            _hangover_frames_left -= 1
-            return _append(frame)
-        else:
-            # Hangover expired — close segment
-            _speech_active = False
-            if _segment_fill > 0:
-                segment = _ensure_buf()[:_segment_fill].copy()
-                _segment_fill = 0
-                _update_noise_floor(rms)
-                return segment
-    else:
-        # Pure silence — update noise floor
-        _update_noise_floor(rms)
-
-    return None
-
-
-def flush() -> np.ndarray | None:
-    """
-    Return any buffered speech segment and reset speech state.
-    Call when the audio source ends (e.g. EOF sentinel from file_capture)
-    to avoid losing the final speech segment that never saw trailing silence.
-    """
-    global _speech_active, _segment_fill
-    if _speech_active and _segment_fill > 0:
-        segment = _ensure_buf()[:_segment_fill].copy()
-        _speech_active = False
-        _segment_fill = 0
-        return segment
-    return None
-
-
-def reset() -> None:
-    """Reset all VAD state — call between sessions."""
-    global _noise_floor, _hangover_frames_left, _speech_active, _segment_fill, _segment_buf
-    _noise_floor = config.NOISE_FLOOR_INIT
-    _hangover_frames_left = 0
-    _speech_active = False
-    _segment_fill = 0
-    _segment_buf = None
+    @property
+    def hangover_frames(self) -> int:
+        """Number of silent frames tolerated before a segment closes."""
+        return self._hangover_frames

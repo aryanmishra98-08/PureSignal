@@ -1,17 +1,12 @@
-"""
-eval/vad_eval.py — VAD parameter sweep evaluation.
+"""VAD parameter sweep evaluation.
 
-Computes segment-level precision, recall, F1, over-segmentation, and
-under-segmentation rates against ground-truth labels (TextGrid or .lab format).
-
-Supports a parameter sweep over energy_multiplier, hangover_ms, zcr_threshold,
-and noise_floor_min_ratio, producing a heatmap that empirically justifies the
-chosen defaults.  Parameters not named in --param-sweep are held at their
-config/base.yaml values.
+Computes segment-level precision, recall, F1, over-segmentation and
+under-segmentation against ground-truth labels, sweeping energy_multiplier
+and hangover_ms to justify the chosen defaults empirically.
 
 Ground truth formats:
-  .lab files:  "start_s end_s label" (per line), speech label = "speech"
-  .TextGrid:   Praat TextGrid with a tier named "speech" (requires textgrid package)
+  .lab       "start_s end_s label" per line; speech rows are labelled "speech"
+  .TextGrid  Praat TextGrid with a tier named "speech" (needs the textgrid pkg)
 
 Directory structure:
   --audio-dir    audio/<name>.wav
@@ -29,132 +24,217 @@ from __future__ import annotations
 
 import argparse
 import csv
-import itertools
 import json
 import sys
 from pathlib import Path
 
 import numpy as np
-from vad_labels import load_ground_truth
-from vad_metrics import compute_metrics
 
-_PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(_PROJECT_ROOT))
-sys.path.insert(0, str(_PROJECT_ROOT / "src"))
-sys.path.insert(0, str(Path(__file__).parent))  # sibling eval modules
+from common import get_pyplot, load_wav
 
-from audio.wav_io import load_wav  # noqa: E402 — needs sys.path above
+_TAG = "vad_eval"
 
-# Sweepable parameter -> the config constant holding its default.
-_SWEEPABLE = {
-    "energy_multiplier": "ENERGY_MULTIPLIER",
-    "hangover_ms": "HANGOVER_MS",
-    "zcr_threshold": "ZCR_THRESHOLD",
-    "noise_floor_min_ratio": "NOISE_FLOOR_MIN_RATIO",
-}
+# A predicted segment counts as a hit when it overlaps a ground-truth interval
+# by at least this fraction of its own duration.
+_IOU_THRESHOLD = 0.3
+
+Interval = tuple[float, float]
 
 
 # ---------------------------------------------------------------------------
-# VAD runner (stateless — resets between files)
+# Ground truth loading
+# ---------------------------------------------------------------------------
+
+def _load_lab(path: Path) -> list[Interval]:
+    """Load speech intervals from a .lab file ("start_s end_s label" lines)."""
+    intervals: list[Interval] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                start, end = float(parts[0]), float(parts[1])
+            except ValueError:
+                continue
+            if parts[2].lower() == "speech":
+                intervals.append((start, end))
+    return intervals
+
+
+def _load_textgrid(path: Path) -> list[Interval]:
+    """Load speech intervals from the 'speech' tier of a Praat TextGrid."""
+    try:
+        import textgrid as tg_lib
+    except ImportError as e:
+        raise RuntimeError(
+            "Install 'textgrid' to read TextGrid files: pip install textgrid"
+        ) from e
+
+    grid = tg_lib.TextGrid.fromFile(str(path))
+    for tier in grid.tiers:
+        if tier.name.lower() == "speech":
+            return [
+                (interval.minTime, interval.maxTime)
+                for interval in tier.intervals
+                if interval.mark.lower() == "speech"
+            ]
+    raise ValueError(f"No 'speech' tier found in {path}")
+
+
+def _load_ground_truth(path: Path) -> list[Interval]:
+    """Dispatch to the loader matching the label file's extension."""
+    suffix = path.suffix.lower()
+    if suffix == ".lab":
+        return _load_lab(path)
+    if suffix == ".textgrid":
+        return _load_textgrid(path)
+    raise ValueError(f"Unsupported label format: {path.suffix}")
+
+
+# ---------------------------------------------------------------------------
+# VAD runner
 # ---------------------------------------------------------------------------
 
 def _run_vad_on_audio(
     audio: np.ndarray,
     sample_rate: int,
-    params: dict,
-) -> list[tuple[float, float]]:
+    energy_multiplier: float,
+    hangover_ms: int,
+) -> list[Interval]:
+    """Run the pipeline VAD over one clip with the given parameters.
+
+    Builds a detector configured for this sweep point. Nothing global is
+    mutated, so sweep points cannot leak settings into each other.
+
+    Returns:
+        The (start_s, end_s) boundaries of each segment the VAD produced.
     """
-    Run the pipeline VAD with overridden parameters. Returns list of
-    (start_s, end_s) segment boundaries produced by the VAD.
+    from audio.vad import VoiceActivityDetector
 
-    Args:
-        params: any of energy_multiplier, hangover_ms, zcr_threshold,
-                noise_floor_min_ratio.
-    """
-    import config as _cfg
+    detector = VoiceActivityDetector(
+        energy_multiplier=energy_multiplier, hangover_ms=hangover_ms
+    )
 
-    # vad.py reads these at call time, so setting them here is enough — no
-    # module-internal constants to patch.
-    _cfg.ENERGY_MULTIPLIER = float(params["energy_multiplier"])
-    _cfg.HANGOVER_MS = int(params["hangover_ms"])
-    _cfg.ZCR_THRESHOLD = float(params["zcr_threshold"])
-    _cfg.NOISE_FLOOR_MIN_RATIO = float(params["noise_floor_min_ratio"])
+    frame_size = detector.frame_samples
+    segments: list[Interval] = []
 
-    from audio import vad
-    vad.reset()
-
-    frame_size = _cfg.FRAME_SAMPLES
-    segments: list[tuple[float, float]] = []
-    offset = 0
-
-    while offset < len(audio):
-        frame = audio[offset: offset + frame_size]
+    for offset in range(0, len(audio), frame_size):
+        frame = audio[offset : offset + frame_size]
         if len(frame) < frame_size:
             frame = np.pad(frame, (0, frame_size - len(frame)))
-        segment = vad.process_frame(frame)
+
+        segment = detector.process_frame(frame)
         if segment is not None:
             end_s = offset / sample_rate
-            # Estimate start from segment length
             start_s = end_s - len(segment) / sample_rate
             segments.append((max(0.0, start_s), end_s))
-        offset += frame_size
 
-    vad.reset()
     return segments
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Segment-level metrics
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="VAD parameter sweep evaluation")
+def _overlap(a: Interval, b: Interval) -> float:
+    """Return the overlap in seconds between two intervals."""
+    return max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
+
+
+def _hits(pred: Interval, ground_truth: list[Interval]) -> list[int]:
+    """Return the indices of the ground-truth intervals ``pred`` matches."""
+    threshold = _IOU_THRESHOLD * (pred[1] - pred[0])
+    return [i for i, gt in enumerate(ground_truth) if _overlap(pred, gt) >= threshold]
+
+
+def _compute_metrics(
+    predicted: list[Interval], ground_truth: list[Interval]
+) -> dict:
+    """Score predicted segments against ground truth.
+
+    Returns:
+        Precision, recall and F1, plus over-/under-segmentation rates and the
+        raw TP/FP/FN counts.
+    """
+    tp = 0
+    matched_gt: set[int] = set()
+    gt_hit_count: dict[int, int] = {}
+
+    for pred in predicted:
+        hits = _hits(pred, ground_truth)
+        if hits:
+            tp += 1
+            matched_gt.add(hits[0])
+        for i in hits:
+            gt_hit_count[i] = gt_hit_count.get(i, 0) + 1
+
+    fp = len(predicted) - tp
+    fn = len(ground_truth) - len(matched_gt)
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall)
+        else 0.0
+    )
+
+    # Over-segmentation: one ground-truth interval matched by several segments.
+    over_seg = sum(1 for c in gt_hit_count.values() if c > 1) / max(
+        len(ground_truth), 1
+    )
+    # Under-segmentation: one segment spanning several ground-truth intervals.
+    under_seg = sum(
+        1
+        for pred in predicted
+        if sum(1 for gt in ground_truth if _overlap(pred, gt) > 0) > 1
+    ) / max(len(predicted), 1)
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "over_segmentation": over_seg,
+        "under_segmentation": under_seg,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "n_predicted": len(predicted),
+        "n_ground_truth": len(ground_truth),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Sweep
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="VAD parameter sweep evaluation")
     parser.add_argument("--audio-dir", required=True)
     parser.add_argument("--labels-dir", required=True)
     parser.add_argument(
         "--param-sweep",
         nargs="+",
         default=["energy_multiplier=2.0,3.0,4.0", "hangover_ms=200,400,600"],
-        help="Param sweep. Sweepable: energy_multiplier, hangover_ms, "
-             "zcr_threshold, noise_floor_min_ratio. "
-             "e.g. 'energy_multiplier=2.0,3.0,4.0' 'zcr_threshold=0.3,0.4,0.5'",
+        help="Param sweep, e.g. 'energy_multiplier=2.0,3.0,4.0' 'hangover_ms=200,400'",
     )
     parser.add_argument("--out", default="eval/results/vad")
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    audio_dir = Path(args.audio_dir)
-    labels_dir = Path(args.labels_dir)
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    import config
-    target_rate = config.SAMPLE_RATE
-
-    # Parse sweep params
-    sweep_params: dict[str, list] = {}
-    for spec in args.param_sweep:
-        name, _, vals = spec.partition("=")
-        sweep_params[name.strip()] = [
-            (int(v) if "." not in v else float(v)) for v in vals.split(",")
+def _parse_sweep(specs: list[str]) -> dict[str, list]:
+    """Parse ``name=v1,v2,v3`` specs into {name: [values]}, ints where possible."""
+    sweep: dict[str, list] = {}
+    for spec in specs:
+        name, _, values = spec.partition("=")
+        sweep[name.strip()] = [
+            float(v) if "." in v else int(v) for v in values.split(",")
         ]
+    return sweep
 
-    unknown = set(sweep_params) - set(_SWEEPABLE)
-    if unknown:
-        print(
-            f"[vad_eval] ERROR: unsweepable parameter(s): {', '.join(sorted(unknown))}")
-        sys.exit(1)
 
-    # Defaults come from the live config, so a one-parameter sweep holds the
-    # rest at their shipped values.
-    grid = {
-        name: sweep_params.get(name, [getattr(config, const)])
-        for name, const in _SWEEPABLE.items()
-    }
-    energy_values = grid["energy_multiplier"]
-    hangover_values = grid["hangover_ms"]
-
-    # Collect audio/label pairs
+def _find_pairs(audio_dir: Path, labels_dir: Path) -> list[tuple[Path, Path]]:
+    """Pair each WAV with its label file, skipping WAVs that have none."""
     pairs: list[tuple[Path, Path]] = []
     for wav_path in sorted(audio_dir.glob("*.wav")):
         for ext in (".lab", ".TextGrid", ".textgrid"):
@@ -162,112 +242,154 @@ def main() -> None:
             if label_path.exists():
                 pairs.append((wav_path, label_path))
                 break
+    return pairs
 
+
+_MEAN_KEYS = (
+    "precision",
+    "recall",
+    "f1",
+    "over_segmentation",
+    "under_segmentation",
+)
+
+
+def _evaluate_params(
+    pairs: list[tuple[Path, Path]],
+    target_rate: int,
+    energy_multiplier: float,
+    hangover_ms: int,
+) -> dict:
+    """Average the segment metrics across every file for one parameter pair."""
+    per_file = [
+        _compute_metrics(
+            _run_vad_on_audio(
+                load_wav(wav_path, target_rate),
+                target_rate,
+                energy_multiplier,
+                hangover_ms,
+            ),
+            _load_ground_truth(label_path),
+        )
+        for wav_path, label_path in pairs
+    ]
+
+    row = {"energy_multiplier": energy_multiplier, "hangover_ms": hangover_ms}
+    row.update(
+        {key: float(np.mean([m[key] for m in per_file])) for key in _MEAN_KEYS}
+    )
+    return row
+
+
+def _plot_heatmap(
+    sweep_rows: list[dict],
+    energy_values: list,
+    hangover_values: list,
+    out_path: Path,
+) -> None:
+    plt = get_pyplot(_TAG)
+    if plt is None:
+        return
+
+    f1_by_params = {
+        (r["energy_multiplier"], r["hangover_ms"]): r["f1"] for r in sweep_rows
+    }
+    grid = np.array([
+        [f1_by_params[(em, hms)] for em in energy_values]
+        for hms in hangover_values
+    ])
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    image = ax.imshow(grid, aspect="auto", cmap="YlGn", vmin=0, vmax=1)
+    ax.set_xticks(range(len(energy_values)))
+    ax.set_xticklabels([str(e) for e in energy_values])
+    ax.set_yticks(range(len(hangover_values)))
+    ax.set_yticklabels([str(h) for h in hangover_values])
+    ax.set_xlabel("energy_multiplier")
+    ax.set_ylabel("hangover_ms")
+    ax.set_title("VAD F1 — parameter sweep")
+    plt.colorbar(image, ax=ax, label="F1")
+
+    for row_idx in range(len(hangover_values)):
+        for col_idx in range(len(energy_values)):
+            ax.text(
+                col_idx,
+                row_idx,
+                f"{grid[row_idx, col_idx]:.2f}",
+                ha="center",
+                va="center",
+                fontsize=8,
+            )
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    print(f"[{_TAG}] heatmap -> {out_path}")
+
+
+def main() -> None:
+    args = _parse_args()
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    import config
+
+    target_rate = config.SAMPLE_RATE
+
+    sweep = _parse_sweep(args.param_sweep)
+    energy_values = sweep.get("energy_multiplier", [config.ENERGY_MULTIPLIER])
+    hangover_values = sweep.get("hangover_ms", [config.HANGOVER_MS])
+
+    pairs = _find_pairs(Path(args.audio_dir), Path(args.labels_dir))
     if not pairs:
-        print("[vad_eval] ERROR: no matching audio/label pairs found")
+        print(f"[{_TAG}] ERROR: no matching audio/label pairs found")
         sys.exit(1)
 
-    names = list(_SWEEPABLE)
-    combos = list(itertools.product(*(grid[n] for n in names)))
-    print(f"[vad_eval] {len(pairs)} file(s), {len(combos)} param combinations")
+    print(
+        f"[{_TAG}] {len(pairs)} file(s), "
+        f"{len(energy_values)}x{len(hangover_values)} param combinations"
+    )
 
     sweep_rows: list[dict] = []
-    best_f1 = -1.0
-    best_params: dict = {}
+    for raw_em in energy_values:
+        for raw_hms in hangover_values:
+            em, hms = float(raw_em), int(raw_hms)
+            row = _evaluate_params(pairs, target_rate, em, hms)
+            sweep_rows.append(row)
+            print(
+                f"  em={em:.1f} hangover={hms:3d}ms  "
+                f"P={row['precision']:.3f} R={row['recall']:.3f} "
+                f"F1={row['f1']:.3f}"
+            )
 
-    for combo in combos:
-        params = dict(zip(names, combo))
-        agg: dict[str, list[float]] = {
-            "precision": [], "recall": [], "f1": [],
-            "over_segmentation": [], "under_segmentation": [],
-        }
-
-        for wav_path, label_path in pairs:
-            audio = load_wav(wav_path)
-            rate = target_rate
-            gt = load_ground_truth(label_path)
-            predicted = _run_vad_on_audio(audio, rate, params)
-            m = compute_metrics(predicted, gt)
-            for key in agg:
-                agg[key].append(m[key])
-
-        row = {
-            **params,
-            "precision": float(np.mean(agg["precision"])),
-            "recall": float(np.mean(agg["recall"])),
-            "f1": float(np.mean(agg["f1"])),
-            "over_segmentation": float(np.mean(agg["over_segmentation"])),
-            "under_segmentation": float(np.mean(agg["under_segmentation"])),
-        }
-        sweep_rows.append(row)
-
-        if row["f1"] > best_f1:
-            best_f1 = row["f1"]
-            best_params = dict(params)
-
-        print(
-            f"  em={params['energy_multiplier']:.1f} "
-            f"hangover={int(params['hangover_ms']):3d}ms "
-            f"zcr={params['zcr_threshold']:.2f} "
-            f"nfmin={params['noise_floor_min_ratio']:.2f}  "
-            f"P={row['precision']:.3f} R={row['recall']:.3f} F1={row['f1']:.3f}"
-        )
-
-    # Write CSV
     csv_path = out_dir / "param_sweep.csv"
-    with open(csv_path, "w", newline="") as f:
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(sweep_rows[0].keys()))
         writer.writeheader()
         writer.writerows(sweep_rows)
-    print(f"\n[vad_eval] sweep results → {csv_path}")
+    print(f"\n[{_TAG}] sweep results -> {csv_path}")
 
-    # Write best params
+    best = max(sweep_rows, key=lambda r: r["f1"])
     best_json = out_dir / "best_params.json"
-    with open(best_json, "w") as f:
-        json.dump({**best_params, "f1": best_f1}, f, indent=2)
-    print(f"[vad_eval] best params → {best_json}")
-    print("  Best: " + ", ".join(f"{k}={v}" for k, v in best_params.items())
-          + f", F1={best_f1:.3f}")
+    with open(best_json, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "energy_multiplier": best["energy_multiplier"],
+                "hangover_ms": best["hangover_ms"],
+                "f1": best["f1"],
+            },
+            f,
+            indent=2,
+        )
+    print(f"[{_TAG}] best params -> {best_json}")
+    print(
+        f"  Best: energy_multiplier={best['energy_multiplier']}, "
+        f"hangover_ms={best['hangover_ms']}, F1={best['f1']:.3f}"
+    )
 
-    # Heatmap — energy_multiplier × hangover_ms, sliced at the best value of
-    # the remaining parameters so the surface is comparable cell to cell.
-    try:
-        import matplotlib.pyplot as plt
-
-        held = {k: best_params[k]
-                for k in ("zcr_threshold", "noise_floor_min_ratio")}
-
-        def _slice(hms):
-            return [r["f1"] for r in sweep_rows
-                    if r["hangover_ms"] == hms
-                    and all(r[k] == v for k, v in held.items())]
-
-        f1_grid = np.array([_slice(hms) for hms in hangover_values])
-
-        fig, ax = plt.subplots(figsize=(6, 4))
-        im = ax.imshow(f1_grid, aspect="auto", cmap="YlGn", vmin=0, vmax=1)
-        ax.set_xticks(range(len(energy_values)))
-        ax.set_xticklabels([str(e) for e in energy_values])
-        ax.set_yticks(range(len(hangover_values)))
-        ax.set_yticklabels([str(h) for h in hangover_values])
-        ax.set_xlabel("energy_multiplier")
-        ax.set_ylabel("hangover_ms")
-        ax.set_title("VAD F1 — parameter sweep\n"
-                     + ", ".join(f"{k}={v}" for k, v in held.items()))
-        plt.colorbar(im, ax=ax, label="F1")
-
-        for i, hms in enumerate(hangover_values):
-            for j, em in enumerate(energy_values):
-                val = f1_grid[i, j]
-                ax.text(j, i, f"{val:.2f}", ha="center",
-                        va="center", fontsize=8)
-
-        fig.tight_layout()
-        heatmap_path = out_dir / "heatmap.png"
-        fig.savefig(heatmap_path, dpi=150)
-        print(f"[vad_eval] heatmap → {heatmap_path}")
-    except ImportError:
-        print("[vad_eval] matplotlib not installed — skipping heatmap")
+    _plot_heatmap(
+        sweep_rows, energy_values, hangover_values, out_dir / "heatmap.png"
+    )
 
 
 if __name__ == "__main__":

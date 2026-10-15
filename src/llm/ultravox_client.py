@@ -1,23 +1,29 @@
-# =============================================================================
-# llm/ultravox_client.py — Fixie.ai Ultravox WebSocket client
-#
-# Responsibilities:
-#   1. Connect to the Ultravox joinUrl
-#   2. Send 20ms PCM chunks (speech segments + silence padding)
-#   3. Receive audio frames from Ultravox and play via sounddevice
-#
-# Threading model:
-#   - _send_loop runs as an async task, reads from audio_send_queue
-#   - _receive_loop runs as an async task; it only ENQUEUES playback audio
-#   - _playback_worker runs on its own thread and does the blocking device write
-#   - main.py feeds audio_send_queue after the policy gate passes
-#
-# Playback must not happen on the event loop: sd.RawOutputStream.write blocks
-# until the device has buffer space, which stalls _send_loop too, degrading
-# uplink pacing exactly when the AI is talking.
-# =============================================================================
+"""Fixie.ai Ultravox WebSocket client.
+
+Responsibilities:
+  1. Connect to the Ultravox join URL.
+  2. Send 20ms PCM chunks — speech segments, with silence padding between them
+     so the stream stays continuous.
+  3. Receive audio frames from Ultravox and play them through sounddevice.
+
+Threading model:
+  - start() runs an asyncio event loop on a background thread.
+  - _send_loop drains audio_send_queue; _receive_loop writes to the speaker.
+  - main.py feeds audio_send_queue once the policy gate passes a segment.
+
+Shutdown:
+  stop() is called from the main thread while the loops are parked on another
+  thread's event loop. A plain flag cannot wake a coroutine blocked in recv(),
+  so stop() reaches into the loop with call_soon_threadsafe and cancels the
+  tasks; cancellation interrupts recv() and closes the socket. stop() then
+  joins the thread before closing the playback stream, so the receive loop can
+  never write to a stream that is already closed.
+"""
+
+from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import queue
 import threading
@@ -28,258 +34,318 @@ import websockets
 import websockets.exceptions
 
 import config
-from audio.resampler import silence_frame_48k, to_48k_pcm
+from audio.resampler import pcm_frame_bytes, silence_frame_48k, to_48k_pcm
 from utils.logger import get_logger
 
 _log = get_logger()
 
-# Queue fed by main.py — holds resampled PCM bytes (full segments)
+# Fed by main.py — holds resampled PCM bytes for whole segments.
 audio_send_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=50)
 
-# Queue fed by _receive_loop, consumed by the playback thread
-_playback_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=200)
-
-# Retry constants for WebSocket connection
 _MAX_RETRIES = 3
 _RETRY_DELAY_S = 2.0
+_CONNECT_TIMEOUT_S = 10
 
-# How long the receive loop waits for a message before re-checking _running
-_RECV_POLL_S = 0.5
+# How long stop() waits for the client thread to exit.
+_SHUTDOWN_TIMEOUT_S = 5.0
 
-# Thread safety for shared state
+# Bytes in one outbound chunk, and the cadence at which they are sent.
+_FRAME_BYTES = pcm_frame_bytes()
+_CHUNK_INTERVAL_S = config.ULTRAVOX_CHUNK_MS / 1000
+
+# Guards the module state shared between the main thread and the loop thread.
 _lock = threading.Lock()
 
-# Playback output stream — opened once, written to continuously
 _output_stream: sd.RawOutputStream | None = None
-_playback_thread: threading.Thread | None = None
-
-# Internal flag to signal shutdown
+_thread: threading.Thread | None = None
+_loop: asyncio.AbstractEventLoop | None = None
 _running = False
 
-# 20ms frame size at 48kHz in bytes (960 samples * 2 bytes per int16 sample)
-_FRAME_BYTES = int(config.ULTRAVOX_IN_RATE *
-                   config.ULTRAVOX_CHUNK_MS / 1000) * 2
+# Authoritative "shutdown wanted" flag. A threading.Event because stop() may
+# arrive before the event loop exists -- racing a start() that has not yet
+# created its tasks, which is exactly what Ctrl+C during startup looks like.
+_stop_requested = threading.Event()
+
+# Owned by the loop thread; touched there or via call_soon_threadsafe.
+# _shutdown mirrors _stop_requested inside the loop so awaits wake promptly.
+_tasks: list[asyncio.Task] = []
+_shutdown: asyncio.Event | None = None
 
 
 def _open_output_stream() -> sd.RawOutputStream:
-    """Open sounddevice output stream for Ultravox audio playback."""
+    """Open the sounddevice stream used for Ultravox playback."""
     stream = sd.RawOutputStream(
         samplerate=config.ULTRAVOX_OUT_RATE,
         channels=1,
         dtype="int16",
-        blocksize=int(config.ULTRAVOX_OUT_RATE *
-                      config.ULTRAVOX_CHUNK_MS / 1000),
+        blocksize=int(config.ULTRAVOX_OUT_RATE * config.ULTRAVOX_CHUNK_MS / 1000),
     )
     stream.start()
-    print(f"[ultravox] playback stream open — {config.ULTRAVOX_OUT_RATE}Hz")
+    _log.info("ultravox", f"playback stream open — {config.ULTRAVOX_OUT_RATE}Hz")
     return stream
 
 
-def _playback_worker() -> None:
-    """
-    Drain _playback_queue to the output device.
+# ---------------------------------------------------------------------------
+# Loops — run on the client thread's event loop
+# ---------------------------------------------------------------------------
 
-    Runs on its own thread so the blocking device write never touches the
-    asyncio event loop.  Exits on the None sentinel.
-    """
-    while True:
-        chunk = _playback_queue.get()
-        if chunk is None:
-            break
-        stream = _output_stream
-        if stream is None:
-            continue
-        try:
-            stream.write(chunk)
-        except sd.PortAudioError as e:
-            print(f"[ultravox] playback error: {e}")
-
-
-def _clear_playback() -> None:
-    """Discard queued playback audio in response to playbackClearBuffer."""
-    dropped = 0
-    while True:
-        try:
-            _playback_queue.get_nowait()
-            dropped += 1
-        except queue.Empty:
-            break
-    if dropped:
-        _log("ultravox", "playback_cleared", frames_discarded=dropped)
+async def _send_segment_frames(ws, segment_bytes: bytes) -> None:
+    """Send one segment as a sequence of fixed-size chunks at real-time cadence."""
+    for offset in range(0, len(segment_bytes), _FRAME_BYTES):
+        frame = segment_bytes[offset : offset + _FRAME_BYTES]
+        if len(frame) < _FRAME_BYTES:  # pad the final short chunk
+            frame += bytes(_FRAME_BYTES - len(frame))
+        await ws.send(frame)
+        await asyncio.sleep(_CHUNK_INTERVAL_S)
 
 
 async def _send_loop(ws) -> None:
-    """
-    Continuously sends 20ms PCM frames to Ultravox WebSocket.
-    Reads complete segments from audio_send_queue.
-    Sends silence frames between segments to maintain stream continuity.
-    """
+    """Forward queued segments, padding the gaps with silence."""
     silence = silence_frame_48k()
 
     while _running:
         try:
-            # Non-blocking check for a new segment
             segment_bytes = audio_send_queue.get_nowait()
-
-            if segment_bytes is None:
-                # Shutdown signal
-                break
-
-            # Slice segment into 20ms frames and send sequentially
-            offset = 0
-            while offset < len(segment_bytes):
-                frame = segment_bytes[offset: offset + _FRAME_BYTES]
-
-                # Pad last frame if shorter than 20ms
-                if len(frame) < _FRAME_BYTES:
-                    frame = frame + bytes(_FRAME_BYTES - len(frame))
-
-                await ws.send(frame)
-                offset += _FRAME_BYTES
-
-                # Maintain 20ms cadence
-                await asyncio.sleep(config.ULTRAVOX_CHUNK_MS / 1000)
-
-            # The pacing above streams a segment at 1x realtime, so this is the
-            # moment the segment has actually left the process. Without it the
-            # latency record stops at enqueue and hides the send cost.
-            _log("ultravox", "segment_flushed",
-                 pcm_bytes=len(segment_bytes),
-                 flush_ts=asyncio.get_running_loop().time())
-
         except queue.Empty:
-            # No segment ready — send silence to keep stream alive
+            # Nothing queued — keep the stream alive.
             await ws.send(silence)
-            await asyncio.sleep(config.ULTRAVOX_CHUNK_MS / 1000)
+            await asyncio.sleep(_CHUNK_INTERVAL_S)
+            continue
+
+        if segment_bytes is None:  # shutdown sentinel
+            break
+        await _send_segment_frames(ws, segment_bytes)
+
+
+def _play(message: bytes) -> None:
+    """Write inbound PCM to the playback stream, if one is open."""
+    stream = _output_stream
+    if stream is None:
+        return
+    try:
+        stream.write(message)
+    except sd.PortAudioError as e:
+        _log.warning("ultravox", f"playback error: {e}")
+
+
+def _handle_control(message: str) -> None:
+    """Act on a JSON control message. Malformed or unknown text is ignored."""
+    try:
+        data = json.loads(message)
+    except json.JSONDecodeError:
+        return
+
+    stream = _output_stream
+    if data.get("type") == "playbackClearBuffer" and stream is not None:
+        # Barge-in: restart the stream to drop what is already buffered.
+        stream.stop()
+        stream.start()
 
 
 async def _receive_loop(ws) -> None:
-    """
-    Receives audio frames from Ultravox and hands them to the playback thread.
-    Binary messages are raw PCM audio.
-    Text messages are JSON data messages (transcript, state, playbackClearBuffer).
-
-    Uses a polled recv with timeout rather than `async for` so the _running flag
-    is re-checked periodically.  `async for` blocks until the server sends
-    something, which made shutdown wait for the full join timeout.
-    """
-    while _running:
-        try:
-            message = await asyncio.wait_for(ws.recv(), timeout=_RECV_POLL_S)
-        except asyncio.TimeoutError:
-            continue
-        except websockets.exceptions.ConnectionClosed:
-            break
-
+    """Play inbound audio and handle control messages until cancelled."""
+    async for message in ws:
         if isinstance(message, bytes):
-            try:
-                _playback_queue.put_nowait(message)
-            except queue.Full:
-                _log("ultravox", "playback_dropped",
-                     reason="playback_queue_full")
+            _play(message)
         else:
-            # JSON data message — check for playbackClearBuffer
-            try:
-                data = json.loads(message)
-                if data.get("type") == "playbackClearBuffer":
-                    _clear_playback()
-            except (json.JSONDecodeError, KeyError):
-                pass  # non-critical text messages — safe to ignore
+            _handle_control(message)
+
+
+async def _serve_connection(ws) -> None:
+    """Run the send and receive loops until one finishes or stop() cancels."""
+    global _running, _tasks
+
+    with _lock:
+        _running = True
+
+    _tasks = [
+        asyncio.create_task(_send_loop(ws), name="ultravox-send"),
+        asyncio.create_task(_receive_loop(ws), name="ultravox-receive"),
+    ]
+    # stop() may have fired while these tasks were being created, in which
+    # case _request_stop found nothing to cancel. Catch that here.
+    if _stop_requested.is_set():
+        for task in _tasks:
+            task.cancel()
+
+    try:
+        await asyncio.gather(*_tasks)
+    except asyncio.CancelledError:
+        pass  # expected path: stop() cancelled the tasks
+    finally:
+        with _lock:
+            _running = False
+        for task in _tasks:
+            task.cancel()
+        await asyncio.gather(*_tasks, return_exceptions=True)
+        _tasks = []
 
 
 async def _run(join_url: str) -> None:
-    """Main async entry — opens WebSocket and runs send + receive concurrently."""
-    global _running
+    """Connect with retries, serve the connection, then tear down."""
+    global _loop, _shutdown
 
-    print(f"[ultravox] connecting to {join_url[:60]}...")
+    with _lock:
+        _loop = asyncio.get_running_loop()
+    _shutdown = asyncio.Event()
+
+    _log.info("ultravox", f"connecting to {join_url[:60]}...")
 
     for attempt in range(1, _MAX_RETRIES + 1):
-        try:
-            async with websockets.connect(join_url, open_timeout=10) as ws:
-                print("[ultravox] connected")
-                with _lock:
-                    _running = True
-
-                await asyncio.gather(
-                    _send_loop(ws),
-                    _receive_loop(ws),
-                )
-            print("[ultravox] WebSocket closed")
+        if _stop_requested.is_set():
             return
+
+        try:
+            async with websockets.connect(
+                join_url, open_timeout=_CONNECT_TIMEOUT_S
+            ) as ws:
+                if _stop_requested.is_set():
+                    return  # the async with closes the socket on the way out
+                _log.info("ultravox", "connected")
+                await _serve_connection(ws)
+            _log.info("ultravox", "WebSocket closed")
+            return
+
         except (websockets.exceptions.WebSocketException, OSError) as e:
-            print(
-                f"[ultravox] connection attempt {attempt}/{_MAX_RETRIES} failed: {e}")
-            if attempt < _MAX_RETRIES:
-                await asyncio.sleep(_RETRY_DELAY_S)
+            _log.warning(
+                "ultravox", f"connection attempt {attempt}/{_MAX_RETRIES} failed: {e}"
+            )
+            if attempt >= _MAX_RETRIES:
+                break
+            # Back off, but abandon the wait the moment stop() arrives.
+            try:
+                await asyncio.wait_for(_shutdown.wait(), timeout=_RETRY_DELAY_S)
+                return
+            except asyncio.TimeoutError:
+                pass
 
-    print("[ultravox] FATAL: all connection attempts failed — giving up")
+    if not _stop_requested.is_set():
+        _log.error("ultravox", "all connection attempts failed — giving up")
 
+
+def _request_stop() -> None:
+    """Wake the loops. Runs on the client thread via call_soon_threadsafe."""
+    if _shutdown is not None:
+        _shutdown.set()
+    for task in _tasks:
+        if not task.done():
+            task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Public API — called from the main thread
+# ---------------------------------------------------------------------------
 
 def start(join_url: str) -> threading.Thread:
+    """Start the client on a background thread.
+
+    Returns:
+        The thread handle. stop() joins it, so callers need not.
+
+    Raises:
+        RuntimeError: If the client is already running.
     """
-    Start the Ultravox client in a background thread.
-    Returns the thread handle so main.py can join on shutdown.
-    """
-    global _output_stream, _playback_thread
+    global _output_stream, _thread
+
+    if _thread is not None and _thread.is_alive():
+        raise RuntimeError("[ultravox] client already started — call stop() first")
+
+    _stop_requested.clear()
+
+    # A sentinel or stale audio left by a previous session would otherwise be
+    # the first thing the new send loop reads.
+    _drain_queue()
+
     _output_stream = _open_output_stream()
-
-    _playback_thread = threading.Thread(
-        target=_playback_worker, daemon=True, name="ultravox-playback"
+    _thread = threading.Thread(
+        target=lambda: asyncio.run(_run(join_url)),
+        daemon=True,
+        name="ultravox-client",
     )
-    _playback_thread.start()
-
-    def _thread_target():
-        asyncio.run(_run(join_url))
-
-    thread = threading.Thread(
-        target=_thread_target, daemon=True, name="ultravox-client"
-    )
-    thread.start()
-    print("[ultravox] client thread started")
-    return thread
+    _thread.start()
+    _log.info("ultravox", "client thread started")
+    return _thread
 
 
-def send_segment(segment: np.ndarray) -> None:
-    """
-    Called by main.py after policy gate passes.
-    Resamples segment to 48kHz PCM and enqueues for send_loop.
+def send_segment(segment: np.ndarray) -> int:
+    """Resample an approved segment and queue it for sending.
 
     Args:
-        segment: float32 ndarray at 16kHz
+        segment: Normalized float32 samples at ``config.SAMPLE_RATE``.
+
+    Returns:
+        The number of PCM bytes queued, or 0 if the queue was full.
     """
     pcm_bytes = to_48k_pcm(segment)
     try:
         audio_send_queue.put_nowait(pcm_bytes)
     except queue.Full:
-        print("[ultravox] send queue full — dropping segment")
-        _log("ultravox", "send_dropped", reason="send_queue_full",
-             pcm_bytes=len(pcm_bytes))
+        _log.warning("ultravox", "send queue full — dropping segment")
+        return 0
+    return len(pcm_bytes)
 
 
-def stop() -> None:
-    """Signal the loops to exit and close the playback stream."""
-    global _running, _output_stream, _playback_thread
+def _drain_queue() -> None:
+    """Discard anything left in the send queue, sentinel included."""
+    while True:
+        try:
+            audio_send_queue.get_nowait()
+        except queue.Empty:
+            return
+
+
+def stop(timeout: float = _SHUTDOWN_TIMEOUT_S) -> None:
+    """Shut the client down and release the playback device.
+
+    Safe to call when the client was never started, and safe to call twice.
+
+    Args:
+        timeout: Seconds to wait for the client thread to exit.
+    """
+    global _running, _output_stream, _thread, _loop
+
+    # Set first: this is what a start() still in flight will observe.
+    _stop_requested.set()
+
     with _lock:
         _running = False
+        loop, thread = _loop, _thread
 
-    # Bounded put: the send loop may already have exited via _running, in which
-    # case nothing will ever drain a full queue and a blocking put would hang.
-    try:
-        audio_send_queue.put(None, timeout=1)
-    except queue.Full:
-        pass
+    # Wake the loops: a bool cannot interrupt a coroutine parked in recv().
+    if loop is not None and not loop.is_closed():
+        with contextlib.suppress(RuntimeError):  # loop already finished
+            loop.call_soon_threadsafe(_request_stop)
 
-    try:
-        _playback_queue.put(None, timeout=1)
-    except queue.Full:
-        pass
-    if _playback_thread is not None:
-        _playback_thread.join(timeout=2)
-        _playback_thread = None
+    with contextlib.suppress(queue.Full):
+        audio_send_queue.put_nowait(None)  # unblock a waiting send loop
 
+    if thread is not None:
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            _log.warning(
+                "ultravox", f"client thread still alive after {timeout}s"
+            )
+
+    # Only now is it safe to close the device: the receive loop has stopped,
+    # so it cannot write to a stream that is already closed.
     with _lock:
-        if _output_stream is not None:
-            _output_stream.stop()
-            _output_stream.close()
-            _output_stream = None
-    print("[ultravox] playback stream closed")
+        stream, _output_stream = _output_stream, None
+        _thread = None
+        _loop = None
+
+    if stream is not None:
+        stream.stop()
+        stream.close()
+        _log.info("ultravox", "playback stream closed")
+
+    _drain_queue()
+
+
+def is_running() -> bool:
+    """Return True while the client is connected and its loops are live."""
+    return _running
+
+
+def client_thread() -> threading.Thread | None:
+    """Return the background client thread, or None if it is not running."""
+    return _thread
